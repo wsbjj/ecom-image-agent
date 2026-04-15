@@ -4,6 +4,7 @@ import { IPC_CHANNELS } from '../../shared/ipc-channels'
 import type { LoopEvent, TaskInput, DefectAnalysis } from '../../shared/types'
 import { createMcpServer, type McpServer } from './mcp-server'
 import type { VLMEvalBridge } from './vlmeval-bridge'
+import type { ImageProvider } from './providers/base'
 import { buildSystemPrompt } from './prompt-builder'
 import { updateTaskSuccess, updateTaskFailed } from '../db/queries'
 import { v4 as uuidv4 } from 'uuid'
@@ -22,9 +23,7 @@ export async function runAgentLoop(
   vlmBridge: VLMEvalBridge,
   signal: AbortSignal,
   options: {
-    googleApiKey: string
-    googleBaseUrl?: string
-    googleImageModel?: string
+    provider: ImageProvider
     anthropicApiKey: string
     anthropicBaseUrl?: string
     anthropicModel?: string
@@ -47,15 +46,17 @@ export async function runAgentLoop(
     }
   }
 
-  const mcpServer: McpServer = await createMcpServer(vlmBridge, {
-    googleApiKey: options.googleApiKey,
-    googleBaseUrl: options.googleBaseUrl,
-    googleImageModel: options.googleImageModel,
-  })
+  const mcpServer: McpServer = await createMcpServer(vlmBridge, options.provider)
   const anthropic = new Anthropic({
     apiKey: options.anthropicApiKey,
     ...(options.anthropicBaseUrl ? { baseURL: options.anthropicBaseUrl } : {}),
   })
+
+  const productImagePaths = input.productImages.map((img) => img.path)
+  const referenceImagePaths = input.referenceImages?.map((img) => img.path)
+  const productImageAngles = input.productImages
+    .map((img) => img.angle)
+    .filter((a): a is string => Boolean(a))
 
   while (retryCount <= MAX_RETRIES) {
     if (signal.aborted) {
@@ -75,6 +76,8 @@ export async function runAgentLoop(
       context: input.context,
       defectAnalysis: lastDefectAnalysis ?? undefined,
       retryCount,
+      productImageAngles: productImageAngles.length > 0 ? productImageAngles : undefined,
+      userPrompt: input.userPrompt,
     })
 
     pushEvent({
@@ -95,12 +98,17 @@ export async function runAgentLoop(
       input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
     }))
 
+    const imagePathsHint = productImagePaths.length > 0
+      ? `\n已提供 ${productImagePaths.length} 张白底商品图，调用 generate_image 时请传入 product_image_paths=${JSON.stringify(productImagePaths)}${referenceImagePaths?.length ? `，参考风格图 reference_image_paths=${JSON.stringify(referenceImagePaths)}` : ''}`
+      : ''
+
     const messages: Anthropic.MessageParam[] = [
       {
         role: 'user',
         content:
           `生成电商精品图：商品名称=${input.productName}，场景=${input.context}，SKU=${input.skuId}。` +
-          `生成图片后立即调用 evaluate_image 工具进行质量评估。`,
+          imagePathsHint +
+          `\n生成图片后立即调用 evaluate_image 工具进行质量评估。`,
       },
     ]
 

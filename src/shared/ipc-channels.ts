@@ -4,6 +4,7 @@ export const IPC_CHANNELS = {
   TASK_LIST: 'task:list',
   AGENT_LOOP_EVENT: 'agent:loop-event',
   CONFIG_GET: 'config:get',
+  CONFIG_GET_VALUE: 'config:get-value',
   CONFIG_SET: 'config:set',
   APP_USER_DATA_PATH: 'app:user-data-path',
   TEMPLATE_SAVE: 'template:save',

@@ -1,7 +1,10 @@
 import { ipcMain, BrowserWindow, safeStorage } from 'electron'
 import { IPC_CHANNELS } from '../../shared/ipc-channels'
 import { runAgentLoop } from '../agent/runner'
-import type { TaskInput } from '../../shared/types'
+import type { TaskInput, ImageProviderName } from '../../shared/types'
+import type { ImageProvider } from '../agent/providers/base'
+import { GeminiProvider } from '../agent/providers/gemini.provider'
+import { SeedreamProvider } from '../agent/providers/seedream.provider'
 import { VLMEvalBridge } from '../agent/vlmeval-bridge'
 import { insertTask, getConfigValue } from '../db/queries'
 import { v4 as uuidv4 } from 'uuid'
@@ -25,6 +28,25 @@ async function getOptionalDecryptedValue(key: string): Promise<string | undefine
   return value.length > 0 ? value : undefined
 }
 
+async function createImageProvider(): Promise<ImageProvider> {
+  const providerName = (await getOptionalDecryptedValue('IMAGE_PROVIDER') ?? 'gemini') as ImageProviderName
+
+  switch (providerName) {
+    case 'seedream': {
+      const apiKey = await getDecryptedKey('APIKEY_SEEDREAM')
+      const endpointId = await getOptionalDecryptedValue('SEEDREAM_ENDPOINT_ID')
+      return new SeedreamProvider({ apiKey, endpointId })
+    }
+    case 'gemini':
+    default: {
+      const apiKey = await getDecryptedKey('GOOGLE_API_KEY')
+      const baseUrl = await getOptionalDecryptedValue('GOOGLE_BASE_URL')
+      const imageModel = await getOptionalDecryptedValue('GOOGLE_IMAGE_MODEL')
+      return new GeminiProvider({ apiKey, baseUrl, imageModel })
+    }
+  }
+}
+
 export function registerAgentHandlers(win: BrowserWindow): void {
   ipcMain.handle(
     IPC_CHANNELS.TASK_START,
@@ -46,17 +68,17 @@ export function registerAgentHandlers(win: BrowserWindow): void {
         taskId,
         skuId: input.skuId,
         productName: input.productName,
+        productImages: JSON.stringify(input.productImages),
+        referenceImages: input.referenceImages ? JSON.stringify(input.referenceImages) : null,
       })
 
       const controller = new AbortController()
       controllers.set(taskId, controller)
 
-      const googleKey = await getDecryptedKey('GOOGLE_API_KEY')
+      const provider = await createImageProvider()
       const anthropicKey = await getDecryptedKey('ANTHROPIC_API_KEY')
       const anthropicBaseUrl = await getOptionalDecryptedValue('ANTHROPIC_BASE_URL')
       const anthropicModel = await getOptionalDecryptedValue('ANTHROPIC_MODEL')
-      const googleBaseUrl = await getOptionalDecryptedValue('GOOGLE_BASE_URL')
-      const googleImageModel = await getOptionalDecryptedValue('GOOGLE_IMAGE_MODEL')
 
       runAgentLoop(
         { ...input, taskId },
@@ -64,9 +86,7 @@ export function registerAgentHandlers(win: BrowserWindow): void {
         vlmBridge,
         controller.signal,
         {
-          googleApiKey: googleKey,
-          googleBaseUrl,
-          googleImageModel,
+          provider,
           anthropicApiKey: anthropicKey,
           anthropicBaseUrl,
           anthropicModel,

@@ -5,6 +5,8 @@ export async function insertTask(params: {
   taskId: string
   skuId: string
   productName: string
+  productImages?: string | null
+  referenceImages?: string | null
 }): Promise<void> {
   await db
     .insertInto('tasks')
@@ -14,6 +16,8 @@ export async function insertTask(params: {
       product_name: params.productName,
       retry_count: 0,
       status: 'running',
+      product_images: params.productImages ?? null,
+      reference_images: params.referenceImages ?? null,
     })
     .execute()
 }

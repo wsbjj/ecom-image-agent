@@ -42,6 +42,7 @@ function parseCsv(text: string): TaskInput[] {
       productName: cols[nameIdx] ?? '',
       context: contextIdx >= 0 ? (cols[contextIdx] ?? '') : '',
       templateId: templateIdx >= 0 ? parseInt(cols[templateIdx] ?? '1', 10) : 1,
+      productImages: [],
     }
   })
 }
@@ -61,6 +62,7 @@ function parseJson(text: string): TaskInput[] {
     productName: item.product_name ?? item.productName ?? '',
     context: item.context ?? '',
     templateId: item.template_id ?? item.templateId ?? 1,
+    productImages: [],
   }))
 }
 

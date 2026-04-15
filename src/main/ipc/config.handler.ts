@@ -28,6 +28,15 @@ export function registerConfigHandlers(): void {
   )
 
   ipcMain.handle(
+    IPC_CHANNELS.CONFIG_GET_VALUE,
+    async (_event, key: string): Promise<{ value: string | null }> => {
+      const val = await getConfigValue(key)
+      if (!val) return { value: null }
+      return { value: safeStorage.decryptString(Buffer.from(val, 'base64')) }
+    },
+  )
+
+  ipcMain.handle(
     IPC_CHANNELS.APP_USER_DATA_PATH,
     async (): Promise<{ path: string }> => {
       return { path: app.getPath('userData') }

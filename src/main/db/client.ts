@@ -11,6 +11,7 @@ import { app } from 'electron'
 import * as path from 'node:path'
 import { up as up001, down as down001 } from './migrations/001_create_tasks'
 import { up as up002, down as down002 } from './migrations/002_create_templates'
+import { up as up003, down as down003 } from './migrations/003_add_image_fields'
 
 export interface TaskTable {
   id: Generated<number>
@@ -24,6 +25,8 @@ export interface TaskTable {
   image_path: string | null
   prompt_used: string | null
   cost_usd: number | null
+  product_images: string | null
+  reference_images: string | null
   created_at: Generated<string>
   updated_at: string | null
 }
@@ -53,6 +56,7 @@ class InlineMigrationProvider implements MigrationProvider {
     return Promise.resolve({
       '001_create_tasks': { up: up001, down: down001 },
       '002_create_templates': { up: up002, down: down002 },
+      '003_add_image_fields': { up: up003, down: down003 },
     })
   }
 }

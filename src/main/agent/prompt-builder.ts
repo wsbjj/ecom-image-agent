@@ -5,12 +5,18 @@ interface PromptBuildInput {
   context: string
   defectAnalysis?: DefectAnalysis
   retryCount: number
+  productImageAngles?: string[]
+  userPrompt?: string
 }
 
 export function buildSystemPrompt(input: PromptBuildInput): string {
+  const angleHint = input.productImageAngles && input.productImageAngles.length > 0
+    ? `\n商品参考图已提供（角度：${input.productImageAngles.join('、')}），生成时必须保持商品外观一致性，不得改变商品形状、颜色或细节。`
+    : ''
+
   const base = `你是一位专业的电商精品图生成 Agent。
 你的任务是为商品「${input.productName}」生成符合电商平台最高标准的精品宣传图。
-场景要求：${input.context}
+场景要求：${input.context}${angleHint}
 
 ## 工作流程（必须严格遵守）
 1. 首先调用 generate_image 工具生成图片
@@ -24,7 +30,9 @@ export function buildSystemPrompt(input: PromptBuildInput): string {
 - 整体商业质量（10分）
 目标总分 >= 85 分才算合格。`
 
-  if (!input.defectAnalysis || input.retryCount === 0) return base
+  if (!input.defectAnalysis || input.retryCount === 0) {
+    return input.userPrompt ? `${base}\n\n## 用户补充要求\n${input.userPrompt}` : base
+  }
 
   const { edge_distortion, perspective_lighting, hallucination, overall_recommendation } =
     input.defectAnalysis
@@ -50,5 +58,6 @@ ${overall_recommendation}
 
 请在 generate_image 的提示词中显式修正上述缺陷。`
 
-  return base + defectSection
+  const result = base + defectSection
+  return input.userPrompt ? `${result}\n\n## 用户补充要求\n${input.userPrompt}` : result
 }

@@ -1,12 +1,23 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useConfigStore } from '../store/config.store'
+import type { ImageProviderName } from '../../shared/types'
 
 export function Settings(): JSX.Element {
-  const { hasAnthropicKey, hasGoogleKey, isChecking, checkKeys, saveKey } =
-    useConfigStore()
+  const {
+    hasAnthropicKey,
+    hasGoogleKey,
+    hasSeedreamKey,
+    activeProvider,
+    isChecking,
+    checkKeys,
+    saveKey,
+    setActiveProvider,
+  } = useConfigStore()
 
   const [anthropicInput, setAnthropicInput] = useState('')
   const [googleInput, setGoogleInput] = useState('')
+  const [seedreamInput, setSeedreamInput] = useState('')
+  const [seedreamEndpointId, setSeedreamEndpointId] = useState('')
   const [anthropicBaseUrl, setAnthropicBaseUrl] = useState('')
   const [anthropicModel, setAnthropicModel] = useState('')
   const [googleBaseUrl, setGoogleBaseUrl] = useState('')
@@ -46,6 +57,7 @@ export function Settings(): JSX.Element {
         setMessage({ type: 'success', text: `${label} 已保存` })
         if (key === 'ANTHROPIC_API_KEY') setAnthropicInput('')
         if (key === 'GOOGLE_API_KEY') setGoogleInput('')
+        if (key === 'APIKEY_SEEDREAM') setSeedreamInput('')
       } else {
         setMessage({ type: 'error', text: `${label} 保存失败` })
       }
@@ -79,6 +91,27 @@ export function Settings(): JSX.Element {
     [saveKey],
   )
 
+  const handleProviderChange = useCallback(
+    async (provider: ImageProviderName) => {
+      setSaving(true)
+      setMessage(null)
+      const ok = await setActiveProvider(provider)
+      setSaving(false)
+      if (ok) {
+        setMessage({ type: 'success', text: `已切换到 ${provider === 'gemini' ? 'Google Gemini' : '即梦 Seedream'}` })
+      } else {
+        setMessage({ type: 'error', text: '切换服务商失败' })
+      }
+    },
+    [setActiveProvider],
+  )
+
+  const providerKeyStatus = (provider: ImageProviderName): boolean => {
+    if (provider === 'gemini') return hasGoogleKey
+    if (provider === 'seedream') return hasSeedreamKey
+    return false
+  }
+
   return (
     <div className="flex-1 p-6 space-y-8 overflow-y-auto max-w-2xl">
       <h1 className="text-2xl font-bold text-gray-100">设置</h1>
@@ -94,6 +127,203 @@ export function Settings(): JSX.Element {
           {message.text}
         </div>
       )}
+
+      {/* Image Provider Selection */}
+      <section className="space-y-4">
+        <h2 className="text-lg font-semibold text-gray-200">图像生成服务</h2>
+        <p className="text-sm text-gray-400">
+          选择用于生成电商精品图的 AI 服务商。切换后新任务将使用所选服务商。
+        </p>
+
+        <div className="space-y-3">
+          {/* Gemini */}
+          <div
+            className={`bg-gray-800/50 border rounded-xl p-4 space-y-3 cursor-pointer transition-colors ${
+              activeProvider === 'gemini'
+                ? 'border-blue-500/50'
+                : 'border-gray-700/50 hover:border-gray-600/50'
+            }`}
+            onClick={() => handleProviderChange('gemini')}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                  activeProvider === 'gemini' ? 'border-blue-500' : 'border-gray-600'
+                }`}>
+                  {activeProvider === 'gemini' && (
+                    <div className="w-2 h-2 rounded-full bg-blue-500" />
+                  )}
+                </div>
+                <div>
+                  <h3 className="text-sm font-medium text-gray-200">Google Gemini</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">gemini-2.0-flash-preview-image-generation</p>
+                </div>
+              </div>
+              {isChecking ? (
+                <span className="text-xs text-gray-500">检查中...</span>
+              ) : hasGoogleKey ? (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
+                  已配置
+                </span>
+              ) : (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">
+                  未配置
+                </span>
+              )}
+            </div>
+
+            {activeProvider === 'gemini' && (
+              <div className="space-y-3 pt-2 border-t border-gray-700/50" onClick={(e) => e.stopPropagation()}>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={googleInput}
+                    onChange={(e) => setGoogleInput(e.target.value)}
+                    placeholder="AIza..."
+                    className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                  />
+                  <button
+                    onClick={() => handleSave('GOOGLE_API_KEY', googleInput, 'Google Key')}
+                    disabled={!googleInput.trim() || saving}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                  >
+                    保存
+                  </button>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs text-gray-400">
+                  <input
+                    type="checkbox"
+                    checked={googleCustomEnabled}
+                    onChange={(e) => setGoogleCustomEnabled(e.target.checked)}
+                  />
+                  自定义配置
+                </label>
+
+                {googleCustomEnabled && (
+                  <>
+                    <input
+                      value={googleBaseUrl}
+                      onChange={(e) => setGoogleBaseUrl(e.target.value)}
+                      placeholder="自定义 Base URL（可留空回退官方）"
+                      className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                    />
+                    <input
+                      value={googleImageModel}
+                      onChange={(e) => setGoogleImageModel(e.target.value)}
+                      placeholder="图像模型（如 gemini-2.0-flash-preview-image-generation）"
+                      className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                    />
+                    <div className="flex justify-end">
+                      <button
+                        onClick={() =>
+                          handleSaveCustom(
+                            [
+                              { key: 'GOOGLE_BASE_URL', value: googleBaseUrl },
+                              { key: 'GOOGLE_IMAGE_MODEL', value: googleImageModel },
+                            ],
+                            'Google 自定义配置',
+                          )
+                        }
+                        disabled={saving}
+                        className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                      >
+                        保存自定义配置
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Seedream */}
+          <div
+            className={`bg-gray-800/50 border rounded-xl p-4 space-y-3 cursor-pointer transition-colors ${
+              activeProvider === 'seedream'
+                ? 'border-blue-500/50'
+                : 'border-gray-700/50 hover:border-gray-600/50'
+            }`}
+            onClick={() => handleProviderChange('seedream')}
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                  activeProvider === 'seedream' ? 'border-blue-500' : 'border-gray-600'
+                }`}>
+                  {activeProvider === 'seedream' && (
+                    <div className="w-2 h-2 rounded-full bg-blue-500" />
+                  )}
+                </div>
+                <div>
+                  <h3 className="text-sm font-medium text-gray-200">字节即梦 Seedream 3.0</h3>
+                  <p className="text-xs text-gray-500 mt-0.5">火山方舟 doubao-seedream-3-0-t2i</p>
+                </div>
+              </div>
+              {isChecking ? (
+                <span className="text-xs text-gray-500">检查中...</span>
+              ) : hasSeedreamKey ? (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
+                  已配置
+                </span>
+              ) : (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">
+                  未配置
+                </span>
+              )}
+            </div>
+
+            {activeProvider === 'seedream' && (
+              <div className="space-y-3 pt-2 border-t border-gray-700/50" onClick={(e) => e.stopPropagation()}>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={seedreamInput}
+                    onChange={(e) => setSeedreamInput(e.target.value)}
+                    placeholder="火山方舟 API Key"
+                    className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                  />
+                  <button
+                    onClick={() => handleSave('APIKEY_SEEDREAM', seedreamInput, 'Seedream Key')}
+                    disabled={!seedreamInput.trim() || saving}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                  >
+                    保存
+                  </button>
+                </div>
+                <input
+                  value={seedreamEndpointId}
+                  onChange={(e) => setSeedreamEndpointId(e.target.value)}
+                  placeholder="模型 Endpoint ID（可选，留空使用默认）"
+                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                />
+                {seedreamEndpointId.trim() && (
+                  <div className="flex justify-end">
+                    <button
+                      onClick={() =>
+                        handleSaveCustom(
+                          [{ key: 'SEEDREAM_ENDPOINT_ID', value: seedreamEndpointId }],
+                          'Seedream Endpoint ID',
+                        )
+                      }
+                      disabled={saving}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                    >
+                      保存 Endpoint ID
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {!providerKeyStatus(activeProvider) && (
+          <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
+            当前选择的服务商尚未配置 API Key，请在上方输入并保存。
+          </div>
+        )}
+      </section>
 
       <section className="space-y-4">
         <h2 className="text-lg font-semibold text-gray-200">API 密钥</h2>
@@ -176,94 +406,6 @@ export function Settings(): JSX.Element {
                           { key: 'ANTHROPIC_MODEL', value: anthropicModel },
                         ],
                         'Anthropic 自定义配置',
-                      )
-                    }
-                    disabled={saving}
-                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
-                  >
-                    保存自定义配置
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* Google */}
-        <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-medium text-gray-200">
-                Google API Key
-              </h3>
-              <p className="text-xs text-gray-500 mt-0.5">
-                用于 Gemini 图像生成 API
-              </p>
-            </div>
-            {isChecking ? (
-              <span className="text-xs text-gray-500">检查中...</span>
-            ) : hasGoogleKey ? (
-              <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
-                已配置
-              </span>
-            ) : (
-              <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">
-                未配置
-              </span>
-            )}
-          </div>
-          <div className="flex gap-2">
-            <input
-              type="password"
-              value={googleInput}
-              onChange={(e) => setGoogleInput(e.target.value)}
-              placeholder="AIza..."
-              className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
-            />
-            <button
-              onClick={() =>
-                handleSave('GOOGLE_API_KEY', googleInput, 'Google Key')
-              }
-              disabled={!googleInput.trim() || saving}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
-            >
-              保存
-            </button>
-          </div>
-
-          <div className="pt-2 border-t border-gray-700/50 space-y-3">
-            <label className="flex items-center gap-2 text-xs text-gray-400">
-              <input
-                type="checkbox"
-                checked={googleCustomEnabled}
-                onChange={(e) => setGoogleCustomEnabled(e.target.checked)}
-              />
-              使用自定义 Google API 配置
-            </label>
-
-            {googleCustomEnabled && (
-              <>
-                <input
-                  value={googleBaseUrl}
-                  onChange={(e) => setGoogleBaseUrl(e.target.value)}
-                  placeholder="自定义 Base URL（可留空回退官方）"
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
-                />
-                <input
-                  value={googleImageModel}
-                  onChange={(e) => setGoogleImageModel(e.target.value)}
-                  placeholder="图像模型（如 gemini-2.0-flash-preview-image-generation）"
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
-                />
-                <div className="flex justify-end">
-                  <button
-                    onClick={() =>
-                      handleSaveCustom(
-                        [
-                          { key: 'GOOGLE_BASE_URL', value: googleBaseUrl },
-                          { key: 'GOOGLE_IMAGE_MODEL', value: googleImageModel },
-                        ],
-                        'Google 自定义配置',
                       )
                     }
                     disabled={saving}

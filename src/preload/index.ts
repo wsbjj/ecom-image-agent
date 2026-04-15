@@ -28,6 +28,9 @@ const api = {
   checkConfig: (key: string): Promise<{ exists: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.CONFIG_GET, key),
 
+  getConfigValue: (key: string): Promise<{ value: string | null }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.CONFIG_GET_VALUE, key),
+
   getUserDataPath: (): Promise<{ path: string }> =>
     ipcRenderer.invoke(IPC_CHANNELS.APP_USER_DATA_PATH),
 

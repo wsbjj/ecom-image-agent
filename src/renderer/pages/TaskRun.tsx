@@ -2,9 +2,10 @@ import { useState, useCallback } from 'react'
 import { TerminalPane } from '../components/TerminalPane'
 import { CsvImporter } from '../components/CsvImporter'
 import { ScoreGauge } from '../components/ScoreGauge'
+import { ImageUploadZone } from '../components/ImageUploadZone'
 import { useAgentStore } from '../store/agent.store'
 import { startTask, stopTask } from '../lib/ipc'
-import type { TaskInput } from '../../shared/types'
+import type { TaskInput, ImageAsset } from '../../shared/types'
 
 export function TaskRun(): JSX.Element {
   const { activeTaskId, currentPhase, currentScore, retryCount, costUsd, isRunning } =
@@ -14,11 +15,21 @@ export function TaskRun(): JSX.Element {
   const [skuId, setSkuId] = useState('')
   const [productName, setProductName] = useState('')
   const [context, setContext] = useState('')
+  const [productImages, setProductImages] = useState<ImageAsset[]>([])
+  const [referenceImages, setReferenceImages] = useState<ImageAsset[]>([])
+  const [userPrompt, setUserPrompt] = useState('')
   const [isBatch, setIsBatch] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
   const handleStart = useCallback(async () => {
-    if (!productName.trim() || !skuId.trim()) return
+    if (!productName.trim() || !skuId.trim()) {
+      setErrorMessage('请输入 SKU 和商品名称')
+      return
+    }
+    if (productImages.length === 0) {
+      setErrorMessage('请至少上传一张白底商品图')
+      return
+    }
     try {
       setErrorMessage(null)
       const taskId = await startTask({
@@ -26,6 +37,9 @@ export function TaskRun(): JSX.Element {
         productName,
         context,
         templateId: 1,
+        productImages,
+        referenceImages: referenceImages.length > 0 ? referenceImages : undefined,
+        userPrompt: userPrompt.trim() || undefined,
       })
       agentStartTask(taskId)
     } catch (error: unknown) {
@@ -33,7 +47,7 @@ export function TaskRun(): JSX.Element {
         error instanceof Error ? error.message : '启动任务失败，请检查配置后重试'
       setErrorMessage(message)
     }
-  }, [skuId, productName, context, agentStartTask])
+  }, [skuId, productName, context, productImages, referenceImages, userPrompt, agentStartTask])
 
   const handleStop = useCallback(async () => {
     if (activeTaskId) {
@@ -90,50 +104,87 @@ export function TaskRun(): JSX.Element {
         {isBatch ? (
           <CsvImporter onImport={handleBatchImport} />
         ) : (
-          <div className="flex gap-3 items-end">
-            <div className="flex-1 space-y-1">
-              <label className="text-xs text-gray-400">SKU</label>
-              <input
-                value={skuId}
-                onChange={(e) => setSkuId(e.target.value)}
-                placeholder="SKU001"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
-              />
+          <div className="space-y-4">
+            {/* Text inputs row */}
+            <div className="flex gap-3 items-end">
+              <div className="flex-1 space-y-1">
+                <label className="text-xs text-gray-400">SKU</label>
+                <input
+                  value={skuId}
+                  onChange={(e) => setSkuId(e.target.value)}
+                  placeholder="SKU001"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div className="flex-1 space-y-1">
+                <label className="text-xs text-gray-400">商品名称</label>
+                <input
+                  value={productName}
+                  onChange={(e) => setProductName(e.target.value)}
+                  placeholder="北欧陶瓷杯"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              <div className="flex-[2] space-y-1">
+                <label className="text-xs text-gray-400">拍摄场景</label>
+                <input
+                  value={context}
+                  onChange={(e) => setContext(e.target.value)}
+                  placeholder="侧逆光极简白底场景，柔和阴影"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+              {isRunning ? (
+                <button
+                  onClick={handleStop}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm font-medium transition-colors whitespace-nowrap"
+                >
+                  停止
+                </button>
+              ) : (
+                <button
+                  onClick={handleStart}
+                  disabled={!productName.trim() || !skuId.trim()}
+                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm font-medium transition-colors whitespace-nowrap"
+                >
+                  开始生成
+                </button>
+              )}
             </div>
-            <div className="flex-1 space-y-1">
-              <label className="text-xs text-gray-400">商品名称</label>
-              <input
-                value={productName}
-                onChange={(e) => setProductName(e.target.value)}
-                placeholder="北欧陶瓷杯"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+
+            {/* Three-column image input area */}
+            <div className="grid grid-cols-3 gap-4">
+              <ImageUploadZone
+                label="白底商品图"
+                required
+                maxFiles={8}
+                value={productImages}
+                onChange={setProductImages}
+                showAngleTag
               />
-            </div>
-            <div className="flex-[2] space-y-1">
-              <label className="text-xs text-gray-400">拍摄场景</label>
-              <input
-                value={context}
-                onChange={(e) => setContext(e.target.value)}
-                placeholder="侧逆光极简白底场景，柔和阴影"
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+              <ImageUploadZone
+                label="参考风格图"
+                maxFiles={5}
+                value={referenceImages}
+                onChange={setReferenceImages}
               />
+              <div className="space-y-2">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-gray-300">自定义提示词</span>
+                  <span className="text-xs text-gray-500">可选</span>
+                </div>
+                <textarea
+                  value={userPrompt}
+                  onChange={(e) => setUserPrompt(e.target.value)}
+                  placeholder="输入补充提示词，会叠加到系统 Prompt 末尾..."
+                  rows={5}
+                  className="w-full min-h-[120px] bg-gray-800/30 border-2 border-dashed border-gray-700 rounded-lg px-3 py-2 text-sm resize-none focus:border-blue-500 focus:outline-none placeholder:text-gray-600"
+                />
+                <p className="text-[10px] text-gray-600 leading-tight">
+                  可在此输入额外指令，如特定构图要求、色调偏好、排除元素等。
+                </p>
+              </div>
             </div>
-            {isRunning ? (
-              <button
-                onClick={handleStop}
-                className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm font-medium transition-colors whitespace-nowrap"
-              >
-                停止
-              </button>
-            ) : (
-              <button
-                onClick={handleStart}
-                disabled={!productName.trim() || !skuId.trim()}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm font-medium transition-colors whitespace-nowrap"
-              >
-                开始生成
-              </button>
-            )}
           </div>
         )}
       </div>

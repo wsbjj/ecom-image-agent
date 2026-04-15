@@ -16,12 +16,23 @@ export interface LoopEvent {
   timestamp: number
 }
 
+export interface ImageAsset {
+  path: string
+  angle?: 'front' | 'side' | 'top' | 'detail' | string
+  isPrimary?: boolean
+}
+
+export type ImageProviderName = 'gemini' | 'seedream'
+
 export interface TaskInput {
   skuId: string
   productName: string
   context: string
   templateId: number
   taskId?: string
+  productImages: ImageAsset[]
+  referenceImages?: ImageAsset[]
+  userPrompt?: string
 }
 
 export interface EvalRequest {
@@ -48,6 +59,8 @@ export interface TaskRecord {
   image_path: string | null
   prompt_used: string | null
   cost_usd: number | null
+  product_images: string | null
+  reference_images: string | null
   created_at: string
   updated_at: string | null
 }
