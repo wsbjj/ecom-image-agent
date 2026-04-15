@@ -74,9 +74,26 @@ describe('Settings', () => {
     render(<Settings />)
     const user = userEvent.setup()
     await screen.findByDisplayValue('sk-ant-test-123456')
-    await user.click(await screen.findByRole('button', { name: '测试连接' }))
+    const testButtons = await screen.findAllByRole('button', { name: '测试连接' })
+    await user.click(testButtons[1])
 
     expect(window.api.testAnthropicConnection).toHaveBeenCalled()
     expect((await screen.findAllByText(/Anthropic 连接测试成功/)).length).toBeGreaterThan(0)
+  })
+
+  it('can test image provider connection from settings page', async () => {
+    vi.mocked(window.api.testImageProviderConnection).mockResolvedValue({
+      success: true,
+      message: 'Google Gemini 图像测试成功（模型: gemini-2.0-flash-preview-image-generation）',
+      durationMs: 120,
+    })
+
+    render(<Settings />)
+    const user = userEvent.setup()
+    const testButtons = await screen.findAllByRole('button', { name: '测试连接' })
+    await user.click(testButtons[0])
+
+    expect(window.api.testImageProviderConnection).toHaveBeenCalled()
+    expect((await screen.findAllByText(/Google Gemini 图像测试成功/)).length).toBeGreaterThan(0)
   })
 })

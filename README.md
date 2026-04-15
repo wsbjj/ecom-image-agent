@@ -5,14 +5,14 @@ Project documentation is maintained in `docs/` with both Chinese and English ver
 ## Documentation Index
 
 - Product Guide
-  - Chinese: [docs/README.zh-CN.md](docs/README.zh-CN.md)
-  - English: [docs/README.en.md](docs/README.en.md)
+  - Chinese: [docs/zh-CN/README.zh-CN.md](docs/zh-CN/README.zh-CN.md)
+  - English: [docs/en/README.en.md](docs/en/README.en.md)
 - Contribution Guide
-  - Chinese: [docs/CONTRIBUTING.zh-CN.md](docs/CONTRIBUTING.zh-CN.md)
-  - English: [docs/CONTRIBUTING.en.md](docs/CONTRIBUTING.en.md)
+  - Chinese: [docs/zh-CN/CONTRIBUTING.zh-CN.md](docs/zh-CN/CONTRIBUTING.zh-CN.md)
+  - English: [docs/en/CONTRIBUTING.en.md](docs/en/CONTRIBUTING.en.md)
 - Architecture
-  - Chinese: [docs/ARCHITECTURE.zh-CN.md](docs/ARCHITECTURE.zh-CN.md)
-  - English: [docs/ARCHITECTURE.en.md](docs/ARCHITECTURE.en.md)
+  - Chinese: [docs/zh-CN/ARCHITECTURE.zh-CN.md](docs/zh-CN/ARCHITECTURE.zh-CN.md)
+  - English: [docs/en/ARCHITECTURE.en.md](docs/en/ARCHITECTURE.en.md)
 
 ## Quick Start
 

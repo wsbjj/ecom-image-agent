@@ -73,4 +73,15 @@ describe('ImageCard', () => {
     render(<ImageCard task={baseTask} />)
     expect(screen.getByText('边缘: 轻微模糊')).toBeInTheDocument()
   })
+
+  it('should convert windows image path to safe file URL', () => {
+    const taskWithImage = {
+      ...baseTask,
+      image_path: 'C:\\Users\\test\\Desktop\\产品图 1.png',
+    }
+    render(<ImageCard task={taskWithImage} />)
+
+    const image = screen.getByAltText('北欧陶瓷杯')
+    expect(image).toHaveAttribute('src', 'file:///C:/Users/test/Desktop/%E4%BA%A7%E5%93%81%E5%9B%BE%201.png')
+  })
 })

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import * as path from 'node:path'
 import { app } from 'electron'
@@ -31,13 +31,35 @@ export class VLMEvalBridge {
     anthropicApiKey: string,
     options?: { anthropicBaseUrl?: string; anthropicModel?: string },
   ): Promise<void> {
-    const scriptPath = path.join(app.getAppPath(), 'python', 'vlmeval_server.py')
+    const appPath = app.getAppPath()
+    const scriptPath = path.join(appPath, 'python', 'vlmeval_server.py')
+    const requirementsPath = path.join(appPath, 'python', 'requirements.txt')
     const workDir = app.getPath('userData')
 
-    this.proc = spawn(pythonPath, [scriptPath, '--workdir', workDir], {
+    // Ensure required Python packages exist before starting JSONL service.
+    const checkDeps = spawnSync(
+      pythonPath,
+      ['-X', 'utf8', '-c', 'import anthropic, pydantic'],
+      { encoding: 'utf8' },
+    )
+    if (checkDeps.status !== 0) {
+      const installDeps = spawnSync(
+        pythonPath,
+        ['-X', 'utf8', '-m', 'pip', 'install', '-r', requirementsPath],
+        { encoding: 'utf8' },
+      )
+      if (installDeps.status !== 0) {
+        const detail = installDeps.stderr || installDeps.stdout || 'unknown pip error'
+        throw new Error(`安装 Python 依赖失败: ${detail}`)
+      }
+    }
+
+    this.proc = spawn(pythonPath, ['-X', 'utf8', scriptPath, '--workdir', workDir], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8',
         ANTHROPIC_API_KEY: anthropicApiKey,
         ...(options?.anthropicBaseUrl
           ? { ANTHROPIC_BASE_URL: options.anthropicBaseUrl }

@@ -1,4 +1,5 @@
 import type { DefectAnalysis, TaskRecord } from '../../shared/types'
+import { toFileUrl } from '../lib/fileUrl'
 
 interface ImageCardProps {
   task: TaskRecord
@@ -41,7 +42,7 @@ function getStatusLabel(status: TaskRecord['status']): string {
 
 export function ImageCard({ task }: ImageCardProps): JSX.Element {
   const defects = parseDefects(task.defect_analysis)
-  const imageSrc = task.image_path ? `file://${task.image_path}` : null
+  const imageSrc = task.image_path ? toFileUrl(task.image_path) : null
 
   return (
     <div className="rounded-xl border border-gray-700/50 bg-gray-800/50 overflow-hidden hover:border-gray-600/50 transition-colors">

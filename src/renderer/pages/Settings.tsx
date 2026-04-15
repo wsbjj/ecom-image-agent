@@ -19,6 +19,10 @@ export function Settings(): JSX.Element {
   const [seedreamInput, setSeedreamInput] = useState('')
   const [seedreamEndpointId, setSeedreamEndpointId] = useState('')
   const [seedreamBaseUrl, setSeedreamBaseUrl] = useState('')
+  const [seedreamCallMode, setSeedreamCallMode] = useState<'visual_official' | 'openai_compat'>('openai_compat')
+  const [seedreamVisualAccessKey, setSeedreamVisualAccessKey] = useState('')
+  const [seedreamVisualSecretKey, setSeedreamVisualSecretKey] = useState('')
+  const [seedreamVisualReqKey, setSeedreamVisualReqKey] = useState('high_aes_general_v30l_zt2i')
   const [anthropicBaseUrl, setAnthropicBaseUrl] = useState('')
   const [anthropicModel, setAnthropicModel] = useState('')
   const [googleBaseUrl, setGoogleBaseUrl] = useState('')
@@ -29,7 +33,12 @@ export function Settings(): JSX.Element {
   const [userDataPath, setUserDataPath] = useState<string>('%APPDATA%/ecom-image-agent')
   const [saving, setSaving] = useState(false)
   const [testingAnthropic, setTestingAnthropic] = useState(false)
+  const [testingImageProvider, setTestingImageProvider] = useState<ImageProviderName | null>(null)
   const [anthropicTestMessage, setAnthropicTestMessage] = useState<{
+    type: 'success' | 'error'
+    text: string
+  } | null>(null)
+  const [imageProviderTestMessage, setImageProviderTestMessage] = useState<{
     type: 'success' | 'error'
     text: string
   } | null>(null)
@@ -50,6 +59,10 @@ export function Settings(): JSX.Element {
         anthropicModelResult,
         googleBaseUrlResult,
         googleImageModelResult,
+        seedreamCallModeResult,
+        seedreamVisualAccessKeyResult,
+        seedreamVisualSecretKeyResult,
+        seedreamVisualReqKeyResult,
       ] = await Promise.all([
         window.api.getConfigValue('ANTHROPIC_API_KEY'),
         window.api.getConfigValue('GOOGLE_API_KEY'),
@@ -60,6 +73,10 @@ export function Settings(): JSX.Element {
         window.api.getConfigValue('ANTHROPIC_MODEL'),
         window.api.getConfigValue('GOOGLE_BASE_URL'),
         window.api.getConfigValue('GOOGLE_IMAGE_MODEL'),
+        window.api.getConfigValue('SEEDREAM_CALL_MODE'),
+        window.api.getConfigValue('SEEDREAM_VISUAL_ACCESS_KEY'),
+        window.api.getConfigValue('SEEDREAM_VISUAL_SECRET_KEY'),
+        window.api.getConfigValue('SEEDREAM_VISUAL_REQ_KEY'),
       ])
 
       const nextAnthropicKey = anthropicKeyResult.value ?? ''
@@ -71,6 +88,13 @@ export function Settings(): JSX.Element {
       const nextAnthropicModel = anthropicModelResult.value ?? ''
       const nextGoogleBaseUrl = googleBaseUrlResult.value ?? ''
       const nextGoogleImageModel = googleImageModelResult.value ?? ''
+      const nextSeedreamCallMode =
+        (seedreamCallModeResult.value as 'visual_official' | 'openai_compat' | null) ??
+        'openai_compat'
+      const nextSeedreamVisualAccessKey = seedreamVisualAccessKeyResult.value ?? ''
+      const nextSeedreamVisualSecretKey = seedreamVisualSecretKeyResult.value ?? ''
+      const nextSeedreamVisualReqKey =
+        seedreamVisualReqKeyResult.value ?? 'high_aes_general_v30l_zt2i'
 
       setAnthropicInput(nextAnthropicKey)
       setGoogleInput(nextGoogleKey)
@@ -81,6 +105,10 @@ export function Settings(): JSX.Element {
       setAnthropicModel(nextAnthropicModel)
       setGoogleBaseUrl(nextGoogleBaseUrl)
       setGoogleImageModel(nextGoogleImageModel)
+      setSeedreamCallMode(nextSeedreamCallMode)
+      setSeedreamVisualAccessKey(nextSeedreamVisualAccessKey)
+      setSeedreamVisualSecretKey(nextSeedreamVisualSecretKey)
+      setSeedreamVisualReqKey(nextSeedreamVisualReqKey)
       setAnthropicCustomEnabled(Boolean(nextAnthropicBaseUrl || nextAnthropicModel))
       setGoogleCustomEnabled(Boolean(nextGoogleBaseUrl || nextGoogleImageModel))
       setSeedreamCustomEnabled(Boolean(nextSeedreamBaseUrl || nextSeedreamEndpointId))
@@ -207,6 +235,68 @@ export function Settings(): JSX.Element {
     }
   }, [anthropicInput, anthropicBaseUrl, anthropicModel])
 
+  const handleTestImageProviderConnection = useCallback(
+    async (provider: ImageProviderName) => {
+      if (typeof window.api.testImageProviderConnection !== 'function') {
+        const nextMessage = {
+          type: 'error' as const,
+          text: '当前应用未加载最新测试接口，请重启桌面应用后重试',
+        }
+        setImageProviderTestMessage(nextMessage)
+        setMessage(nextMessage)
+        return
+      }
+
+      setTestingImageProvider(provider)
+      setImageProviderTestMessage(null)
+      setMessage(null)
+      try {
+        const result = await window.api.testImageProviderConnection({
+          provider,
+          apiKey: provider === 'gemini' ? googleInput : seedreamInput,
+          baseUrl: provider === 'gemini' ? googleBaseUrl : seedreamBaseUrl,
+          model: provider === 'gemini' ? googleImageModel : undefined,
+          endpointId: provider === 'seedream' ? seedreamEndpointId : undefined,
+          callMode: provider === 'seedream' ? seedreamCallMode : undefined,
+          accessKeyId: provider === 'seedream' ? seedreamVisualAccessKey : undefined,
+          secretAccessKey: provider === 'seedream' ? seedreamVisualSecretKey : undefined,
+          reqKey: provider === 'seedream' ? seedreamVisualReqKey : undefined,
+        })
+        const elapsed = result.durationMs ? `，耗时 ${result.durationMs}ms` : ''
+        const nextMessage = {
+          type: result.success ? 'success' : 'error',
+          text: result.success
+            ? `${result.message}${elapsed}`
+            : `${provider === 'gemini' ? 'Google Gemini' : 'Seedream'} 图像测试失败：${result.message}${elapsed}`,
+        } as const
+        setImageProviderTestMessage(nextMessage)
+        setMessage(nextMessage)
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error)
+        const nextMessage = {
+          type: 'error' as const,
+          text: `${provider === 'gemini' ? 'Google Gemini' : 'Seedream'} 图像测试失败：${text}`,
+        }
+        setImageProviderTestMessage(nextMessage)
+        setMessage(nextMessage)
+      } finally {
+        setTestingImageProvider(null)
+      }
+    },
+    [
+      googleBaseUrl,
+      googleImageModel,
+      googleInput,
+      seedreamBaseUrl,
+      seedreamCallMode,
+      seedreamEndpointId,
+      seedreamInput,
+      seedreamVisualAccessKey,
+      seedreamVisualReqKey,
+      seedreamVisualSecretKey,
+    ],
+  )
+
   return (
     <div className="flex-1 p-6 space-y-8 overflow-y-auto max-w-2xl">
       <h1 className="text-2xl font-bold text-gray-100">设置</h1>
@@ -283,6 +373,13 @@ export function Settings(): JSX.Element {
                     className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
                   >
                     保存
+                  </button>
+                  <button
+                    onClick={() => handleTestImageProviderConnection('gemini')}
+                    disabled={testingImageProvider !== null || saving}
+                    className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                  >
+                    {testingImageProvider === 'gemini' ? '测试中...' : '测试连接'}
                   </button>
                 </div>
 
@@ -385,6 +482,13 @@ export function Settings(): JSX.Element {
                   >
                     保存
                   </button>
+                  <button
+                    onClick={() => handleTestImageProviderConnection('seedream')}
+                    disabled={testingImageProvider !== null || saving}
+                    className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                  >
+                    {testingImageProvider === 'seedream' ? '测试中...' : '测试连接'}
+                  </button>
                 </div>
                 <label className="flex items-center gap-2 text-xs text-gray-400">
                   <input
@@ -397,6 +501,15 @@ export function Settings(): JSX.Element {
 
                 {seedreamCustomEnabled && (
                   <>
+                    <label className="text-xs text-gray-400">调用模式</label>
+                    <select
+                      value={seedreamCallMode}
+                      onChange={(e) => setSeedreamCallMode(e.target.value as 'visual_official' | 'openai_compat')}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+                    >
+                      <option value="visual_official">官方 Visual 接口（推荐）</option>
+                      <option value="openai_compat">OpenAI 兼容接口</option>
+                    </select>
                     <input
                       value={seedreamBaseUrl}
                       onChange={(e) => setSeedreamBaseUrl(e.target.value)}
@@ -409,10 +522,36 @@ export function Settings(): JSX.Element {
                       placeholder="模型 Endpoint ID（可选，留空使用默认）"
                       className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
                     />
+                    {seedreamCallMode === 'visual_official' && (
+                      <>
+                        <input
+                          value={seedreamVisualAccessKey}
+                          onChange={(e) => setSeedreamVisualAccessKey(e.target.value)}
+                          placeholder="Visual AccessKey ID（AK）"
+                          className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                        />
+                        <input
+                          type="password"
+                          value={seedreamVisualSecretKey}
+                          onChange={(e) => setSeedreamVisualSecretKey(e.target.value)}
+                          placeholder="Visual SecretAccessKey（SK）"
+                          className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                        />
+                        <input
+                          value={seedreamVisualReqKey}
+                          onChange={(e) => setSeedreamVisualReqKey(e.target.value)}
+                          placeholder="Visual req_key（默认 high_aes_general_v30l_zt2i）"
+                          className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                        />
+                      </>
+                    )}
                   </>
                 )}
 
-                {(seedreamEndpointId.trim() || seedreamBaseUrl.trim()) && (
+                {(seedreamEndpointId.trim() ||
+                  seedreamBaseUrl.trim() ||
+                  seedreamCallMode === 'visual_official' ||
+                  seedreamCallMode === 'openai_compat') && (
                   <div className="flex justify-end">
                     <button
                       onClick={() =>
@@ -420,6 +559,10 @@ export function Settings(): JSX.Element {
                           [
                             { key: 'SEEDREAM_BASE_URL', value: seedreamBaseUrl },
                             { key: 'SEEDREAM_ENDPOINT_ID', value: seedreamEndpointId },
+                            { key: 'SEEDREAM_CALL_MODE', value: seedreamCallMode },
+                            { key: 'SEEDREAM_VISUAL_ACCESS_KEY', value: seedreamVisualAccessKey },
+                            { key: 'SEEDREAM_VISUAL_SECRET_KEY', value: seedreamVisualSecretKey },
+                            { key: 'SEEDREAM_VISUAL_REQ_KEY', value: seedreamVisualReqKey },
                           ],
                           'Seedream 自定义配置',
                         )
@@ -435,6 +578,18 @@ export function Settings(): JSX.Element {
             )}
           </div>
         </div>
+
+        {imageProviderTestMessage && (
+          <div
+            className={`rounded-lg px-3 py-2 text-sm ${
+              imageProviderTestMessage.type === 'success'
+                ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                : 'bg-red-500/10 text-red-400 border border-red-500/30'
+            }`}
+          >
+            {imageProviderTestMessage.text}
+          </div>
+        )}
 
         {!providerKeyStatus(activeProvider) && (
           <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">

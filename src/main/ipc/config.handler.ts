@@ -1,6 +1,9 @@
 import { app, ipcMain, safeStorage } from 'electron'
 import Anthropic from '@anthropic-ai/sdk'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import { IPC_CHANNELS } from '../../shared/ipc-channels'
+import { SeedreamProvider } from '../agent/providers/seedream.provider'
+import { SeedreamVisualProvider } from '../agent/providers/seedream-visual.provider'
 import {
   setConfigValue,
   getConfigValue,
@@ -8,7 +11,7 @@ import {
   listTemplates,
   deleteTemplate,
 } from '../db/queries'
-import type { TemplateInput, TemplateRecord } from '../../shared/types'
+import type { TemplateInput, TemplateRecord, ImageProviderName } from '../../shared/types'
 
 async function getOptionalDecryptedValue(key: string): Promise<string | undefined> {
   const val = await getConfigValue(key)
@@ -77,6 +80,128 @@ export function registerConfigHandlers(): void {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return { success: false, message }
+      }
+    },
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.CONFIG_TEST_IMAGE_PROVIDER,
+    async (
+      _event,
+      params: {
+        provider: ImageProviderName
+        apiKey?: string
+        baseUrl?: string
+        model?: string
+        endpointId?: string
+        callMode?: 'visual_official' | 'openai_compat'
+        accessKeyId?: string
+        secretAccessKey?: string
+        reqKey?: string
+      },
+    ): Promise<{ success: boolean; message: string; durationMs?: number }> => {
+      const startedAt = Date.now()
+      try {
+        if (params.provider === 'gemini') {
+          const apiKey = params.apiKey?.trim() || (await getOptionalDecryptedValue('GOOGLE_API_KEY'))
+          const baseUrl = params.baseUrl?.trim() || (await getOptionalDecryptedValue('GOOGLE_BASE_URL'))
+          const model =
+            params.model?.trim() ||
+            (await getOptionalDecryptedValue('GOOGLE_IMAGE_MODEL')) ||
+            'gemini-2.0-flash-preview-image-generation'
+
+          if (!apiKey) {
+            return { success: false, message: '请先输入 Google API Key' }
+          }
+
+          const genAI = new GoogleGenerativeAI(apiKey)
+          const imageModel = genAI.getGenerativeModel(
+            { model },
+            baseUrl ? { baseUrl } : undefined,
+          )
+          const result = await imageModel.generateContent({
+            contents: [{ role: 'user', parts: [{ text: 'Generate a plain white square image for API connectivity test.' }] }],
+            generationConfig: {
+              responseMimeType: 'image/png',
+            },
+          })
+          const hasImage = Boolean(
+            result.response.candidates?.[0]?.content.parts.some((part) =>
+              part.inlineData?.mimeType?.startsWith('image/'),
+            ),
+          )
+          if (!hasImage) {
+            throw new Error('Gemini 未返回图片数据')
+          }
+
+          return {
+            success: true,
+            message: `Google Gemini 图像测试成功（模型: ${model}）`,
+            durationMs: Date.now() - startedAt,
+          }
+        }
+
+        const apiKey = params.apiKey?.trim() || (await getOptionalDecryptedValue('APIKEY_SEEDREAM'))
+        const baseUrl =
+          params.baseUrl?.trim() ||
+          (await getOptionalDecryptedValue('SEEDREAM_BASE_URL')) ||
+          'https://ark.cn-beijing.volces.com/api/v3'
+        const endpointId =
+          params.endpointId?.trim() ||
+          params.model?.trim() ||
+          (await getOptionalDecryptedValue('SEEDREAM_ENDPOINT_ID')) ||
+          'doubao-seedream-3-0-t2i-250415'
+        const callMode =
+          params.callMode ||
+          ((await getOptionalDecryptedValue('SEEDREAM_CALL_MODE')) as
+            | 'visual_official'
+            | 'openai_compat'
+            | undefined) ||
+          'openai_compat'
+        const accessKeyId =
+          params.accessKeyId?.trim() ||
+          (await getOptionalDecryptedValue('SEEDREAM_VISUAL_ACCESS_KEY'))
+        const secretAccessKey =
+          params.secretAccessKey?.trim() ||
+          (await getOptionalDecryptedValue('SEEDREAM_VISUAL_SECRET_KEY'))
+        const reqKey =
+          params.reqKey?.trim() ||
+          (await getOptionalDecryptedValue('SEEDREAM_VISUAL_REQ_KEY')) ||
+          'high_aes_general_v30l_zt2i'
+
+        if (!apiKey) {
+          return { success: false, message: '请先输入 Seedream API Key' }
+        }
+
+        const fallbackProvider = new SeedreamProvider({
+          apiKey,
+          baseUrl,
+          endpointId,
+        })
+        const provider =
+          callMode === 'visual_official'
+            ? new SeedreamVisualProvider({
+                accessKeyId,
+                secretAccessKey,
+                reqKey,
+                fallbackProvider,
+              })
+            : fallbackProvider
+
+        const generated = await provider.generate({
+          prompt: 'A plain white background image for API connectivity test.',
+          productImagePaths: [],
+          aspectRatio: '1:1',
+        })
+
+        return {
+          success: true,
+          message: `Seedream 图像测试成功（模型: ${endpointId}，模式: ${generated.debugInfo?.providerMode ?? 'openai_compat'})`,
+          durationMs: Date.now() - startedAt,
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { success: false, message, durationMs: Date.now() - startedAt }
       }
     },
   )

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { Terminal } from 'xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { useAgentStore } from '../store/agent.store'
@@ -18,6 +18,31 @@ export function TerminalPane(): JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const handleLoopEvent = useAgentStore((s) => s.handleLoopEvent)
+  const logLines = useAgentStore((s) => s.logLines)
+  const [copyLabel, setCopyLabel] = useState('复制日志')
+
+  const copySelection = async (term: Terminal): Promise<void> => {
+    const selected = term.getSelection()
+    if (!selected) return
+    try {
+      await navigator.clipboard.writeText(selected)
+    } catch {
+      // Ignore clipboard failures (e.g., permission denied).
+    }
+  }
+
+  const copyAllLogs = useCallback(async () => {
+    const content = logLines.join('\n')
+    if (!content) return
+    try {
+      await navigator.clipboard.writeText(content)
+      setCopyLabel('已复制')
+      setTimeout(() => setCopyLabel('复制日志'), 1200)
+    } catch {
+      setCopyLabel('复制失败')
+      setTimeout(() => setCopyLabel('复制日志'), 1200)
+    }
+  }, [logLines])
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -39,7 +64,24 @@ export function TerminalPane(): JSX.Element {
       fitAddon.fit()
       termRef.current = term
       term.writeln('\x1b[1;36m=== EcomAgent Terminal ===\x1b[0m')
+      term.writeln('\x1b[2m提示: 选中文本后按 Ctrl/Cmd + C 可复制\x1b[0m')
       term.writeln('')
+
+      term.attachCustomKeyEventHandler((event) => {
+        const isCopy = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c'
+        if (isCopy && term.hasSelection()) {
+          void copySelection(term)
+          return false
+        }
+        return true
+      })
+
+      const handleContextMenu = (event: MouseEvent): void => {
+        if (!term.hasSelection()) return
+        event.preventDefault()
+        void copySelection(term)
+      }
+      containerRef.current.addEventListener('contextmenu', handleContextMenu)
 
       const unsubscribe = window.api.onAgentEvent((event: LoopEvent) => {
         handleLoopEvent(event)
@@ -64,6 +106,7 @@ export function TerminalPane(): JSX.Element {
       return () => {
         unsubscribe()
         observer.disconnect()
+        containerRef.current?.removeEventListener('contextmenu', handleContextMenu)
         term.dispose()
       }
     } catch (error: unknown) {
@@ -77,5 +120,15 @@ export function TerminalPane(): JSX.Element {
     }
   }, [handleLoopEvent])
 
-  return <div ref={containerRef} className="h-full w-full rounded-lg overflow-hidden" />
+  return (
+    <div className="relative h-full w-full rounded-lg overflow-hidden border border-gray-700/40">
+      <button
+        onClick={copyAllLogs}
+        className="absolute top-2 right-2 z-10 px-2 py-1 text-xs rounded bg-gray-800/90 text-gray-300 hover:text-white border border-gray-600/70 hover:border-gray-500 transition-colors"
+      >
+        {copyLabel}
+      </button>
+      <div ref={containerRef} className="h-full w-full" />
+    </div>
+  )
 }

@@ -27,6 +27,13 @@ function createWindow(): void {
     mainWindow?.show()
   })
 
+  mainWindow.webContents.on('before-input-event', (_event, input) => {
+    const key = input.key.toLowerCase()
+    if (key === 'f12' || ((input.control || input.meta) && input.shift && key === 'i')) {
+      mainWindow?.webContents.toggleDevTools()
+    }
+  })
+
   registerAgentHandlers(mainWindow)
   registerTaskHandlers()
   registerConfigHandlers()

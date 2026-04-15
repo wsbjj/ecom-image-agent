@@ -2,5 +2,5 @@
 
 This is the entry file for architecture docs.
 
-- Chinese: [ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md)
-- English: [ARCHITECTURE.en.md](ARCHITECTURE.en.md)
+- Chinese: [zh-CN/ARCHITECTURE.zh-CN.md](zh-CN/ARCHITECTURE.zh-CN.md)
+- English: [en/ARCHITECTURE.en.md](en/ARCHITECTURE.en.md)

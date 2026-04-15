@@ -10,6 +10,12 @@ export interface GenerateImageResult {
   imagePath: string
   promptUsed: string
   costUsd?: number
+  debugInfo?: {
+    requestId?: string
+    taskId?: string
+    providerMode?: 'visual_official' | 'openai_compat'
+    fallbackReason?: string
+  }
 }
 
 export interface ImageProvider {

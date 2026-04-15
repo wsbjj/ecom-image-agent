@@ -1,10 +1,13 @@
-import { ipcMain, BrowserWindow, safeStorage } from 'electron'
+import { app, ipcMain, BrowserWindow, safeStorage } from 'electron'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 import { IPC_CHANNELS } from '../../shared/ipc-channels'
 import { runAgentLoop } from '../agent/runner'
 import type { TaskInput, ImageProviderName } from '../../shared/types'
 import type { ImageProvider } from '../agent/providers/base'
 import { GeminiProvider } from '../agent/providers/gemini.provider'
 import { SeedreamProvider } from '../agent/providers/seedream.provider'
+import { SeedreamVisualProvider } from '../agent/providers/seedream-visual.provider'
 import { VLMEvalBridge } from '../agent/vlmeval-bridge'
 import { insertTask, getConfigValue } from '../db/queries'
 import { v4 as uuidv4 } from 'uuid'
@@ -12,6 +15,20 @@ import { v4 as uuidv4 } from 'uuid'
 const controllers = new Map<string, AbortController>()
 const vlmBridge = new VLMEvalBridge()
 let vlmStarted = false
+
+function resolvePythonPath(): string {
+  const appPath = app.getAppPath()
+  const venvPython =
+    process.platform === 'win32'
+      ? path.join(appPath, 'python', '.venv', 'Scripts', 'python.exe')
+      : path.join(appPath, 'python', '.venv', 'bin', 'python')
+
+  if (fs.existsSync(venvPython)) {
+    return venvPython
+  }
+
+  return process.platform === 'win32' ? 'python' : 'python3'
+}
 
 async function getDecryptedKey(key: string): Promise<string> {
   const encrypted = await getConfigValue(key)
@@ -33,10 +50,28 @@ async function createImageProvider(): Promise<ImageProvider> {
 
   switch (providerName) {
     case 'seedream': {
-      const apiKey = await getDecryptedKey('APIKEY_SEEDREAM')
+      const callMode = (await getOptionalDecryptedValue('SEEDREAM_CALL_MODE')) ?? 'openai_compat'
+      const apiKey = await getOptionalDecryptedValue('APIKEY_SEEDREAM')
       const baseUrl = await getOptionalDecryptedValue('SEEDREAM_BASE_URL')
       const endpointId = await getOptionalDecryptedValue('SEEDREAM_ENDPOINT_ID')
-      return new SeedreamProvider({ apiKey, baseUrl, endpointId })
+      const fallbackProvider = apiKey
+        ? new SeedreamProvider({ apiKey, baseUrl, endpointId })
+        : undefined
+      if (callMode === 'visual_official') {
+        const accessKeyId = await getOptionalDecryptedValue('SEEDREAM_VISUAL_ACCESS_KEY')
+        const secretAccessKey = await getOptionalDecryptedValue('SEEDREAM_VISUAL_SECRET_KEY')
+        const reqKey = await getOptionalDecryptedValue('SEEDREAM_VISUAL_REQ_KEY')
+        return new SeedreamVisualProvider({
+          accessKeyId,
+          secretAccessKey,
+          reqKey,
+          fallbackProvider,
+        })
+      }
+      if (!fallbackProvider) {
+        throw new Error('配置项 APIKEY_SEEDREAM 未设置，请先在 Settings 页面配置')
+      }
+      return fallbackProvider
     }
     case 'gemini':
     default: {
@@ -53,7 +88,7 @@ export function registerAgentHandlers(win: BrowserWindow): void {
     IPC_CHANNELS.TASK_START,
     async (_event, input: TaskInput): Promise<{ taskId: string }> => {
       if (!vlmStarted) {
-        const pythonPath = process.platform === 'win32' ? 'python' : 'python3'
+        const pythonPath = resolvePythonPath()
         const anthropicKey = await getDecryptedKey('ANTHROPIC_API_KEY')
         const anthropicBaseUrl = await getOptionalDecryptedValue('ANTHROPIC_BASE_URL')
         const anthropicModel = await getOptionalDecryptedValue('ANTHROPIC_MODEL')
