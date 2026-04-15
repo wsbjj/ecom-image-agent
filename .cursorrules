@@ -1,0 +1,82 @@
+# EcomAgent — Cursor 项目规则
+
+## 项目概览
+电商精品图生成与视觉评估 Agent 桌面应用。
+- 桌面端：Electron 40 + electron-vite 三目标构建
+- 界面：React 19 + Tailwind CSS 4（原子化，零内联 style）
+- 语言：TypeScript strict，零 any，所有类型从 src/shared/types.ts 导入
+- AI：Claude Agent SDK（TS）+ MCP In-Process Server + VLMEvalKit Python 子进程
+- 数据库：SQLite via Kysely，WAL 模式，InlineMigrationProvider
+
+---
+
+## TypeScript 规范（严格执行）
+
+- 所有文件必须开启 `strict: true`，禁止 `any`，禁止 `@ts-ignore`
+- 使用 `satisfies` 操作符做编译期类型断言，不用 `as` 强转
+- 函数参数和返回值必须有明确类型注解，不依赖隐式推断
+- 跨层共享类型（LoopEvent、TaskInput、DefectAnalysis 等）统一在 `src/shared/types.ts` 定义
+  - 渲染进程禁止从 `src/main/**` 导入任何模块或类型
+  - 主进程禁止从 `src/renderer/**` 导入任何模块或类型
+- IPC channel 名称只能从 `src/shared/ipc-channels.ts` 导入，禁止硬编码字符串
+
+## Electron 架构规范
+
+- 主进程（src/main）与渲染进程（src/renderer）严格分离，通过 contextBridge 通信
+- 所有主进程模块只在主进程中初始化，禁止在渲染进程中 require/import Node.js 原生模块
+- preload/index.ts 只暴露 contextBridge API，不做任何业务逻辑
+- IPC handler 注册统一在对应 `*handler.ts` 文件中，通过 `registerXxxHandlers(win)` 调用
+- 窗口创建、子进程管理、DB 操作只允许在主进程中执行
+
+## Agent / MCP 规范
+
+- ReAct 循环只在主进程 agent/runner.ts 中运行，禁止在渲染进程中执行 AI 逻辑
+- MCP Tool 注册统一在 agent/mcp-server.ts 的 `createMcpServer(vlmBridge, googleApiKey)` 工厂函数中
+- API Key 必须通过 Electron `safeStorage` 加密存储在 SQLite config 表，禁止写入 .env 或 process.env 全局
+- VLMEvalBridge 子进程启动时通过 spawn env 注入解密后的 ANTHROPIC_API_KEY
+- 任务中止必须通过 AbortController.abort()，禁止用 DB 状态轮询作为唯一中止机制
+- runner.ts 每轮循环必须从 SDK stream usage 字段读取 token 数并写入 tasks.cost_usd
+
+## React / 渲染进程规范
+
+- 组件文件使用 PascalCase 命名，工具函数文件使用 camelCase
+- 使用 React 19 并发特性（`use`、`Suspense`），禁止类组件
+- 零内联 style（`style={{...}}`），所有样式通过 Tailwind CSS 原子类实现
+- Zustand store 按模块拆分（task / agent / config），必须使用 `subscribeWithSelector` middleware
+- store 内状态变更必须通过 action 函数，禁止在组件内直接 `setState`
+- xterm.js 必须在 `term.open()` 之后加载渲染 Addon（WebGL 优先，失败降级 Canvas）
+- Monaco Editor 配置 JSON schema 校验，针对任务矩阵 JSON 格式
+
+## 数据库规范
+
+- 所有 schema 变更通过 Kysely migration 管理，使用 InlineMigrationProvider（禁止 FileMigrationProvider）
+- 迁移文件命名：`NNN_description.ts`（如 `001_create_tasks.ts`），只增不减
+- 所有写操作必须在事务内完成
+- SQLite 启动时执行 `PRAGMA journal_mode = WAL` 和 `PRAGMA foreign_keys = ON`
+
+## 代码风格
+
+- 缩进：2 空格，不使用 Tab
+- 字符串：单引号（TypeScript），双引号（JSX attribute）
+- 禁止无用注释（如 `// 导入模块`、`// 返回结果`），注释只解释非显而易见的意图
+- 导入顺序：Node 内置 → 第三方包 → 项目内部（shared → main/renderer → 相对路径）
+- 每个文件职责单一，超过 300 行考虑拆分
+
+## 文件命名约定
+
+| 文件类型 | 命名规范 | 示例 |
+|---------|---------|------|
+| React 组件 | PascalCase.tsx | TerminalPane.tsx |
+| Zustand store | camelCase.store.ts | agent.store.ts |
+| IPC handler | camelCase.handler.ts | agent.handler.ts |
+| DB migration | NNN_snake_case.ts | 001_create_tasks.ts |
+| 测试文件 | 原文件名.test.ts/tsx | runner.test.ts |
+
+## 禁止事项
+
+- 禁止在渲染进程直接调用 Node.js API（fs、path、child_process 等）
+- 禁止将 API Key 以明文写入任何文件（.env、代码注释、日志）
+- 禁止使用 `document.createElement` 操作 DOM，一律通过 React 渲染
+- 禁止在 MCP Tool 的工具回调中执行耗时超过 5 秒的同步操作
+- 禁止跳过 TypeScript 类型检查（`// @ts-nocheck`、`// @ts-ignore`）
+- 禁止在 migration 文件中使用原始 SQL 字符串（只用 Kysely schema builder API）
