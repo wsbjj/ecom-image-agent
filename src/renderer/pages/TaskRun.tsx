@@ -26,10 +26,16 @@ export function TaskRun(): JSX.Element {
       setErrorMessage('请输入 SKU 和商品名称')
       return
     }
-    if (productImages.length === 0) {
+    const validProductImages = productImages.filter(
+      (img) => typeof img.path === 'string' && img.path.trim().length > 0,
+    )
+    if (validProductImages.length === 0) {
       setErrorMessage('请至少上传一张白底商品图')
       return
     }
+    const validReferenceImages = referenceImages.filter(
+      (img) => typeof img.path === 'string' && img.path.trim().length > 0,
+    )
     try {
       setErrorMessage(null)
       const taskId = await startTask({
@@ -37,8 +43,8 @@ export function TaskRun(): JSX.Element {
         productName,
         context,
         templateId: 1,
-        productImages,
-        referenceImages: referenceImages.length > 0 ? referenceImages : undefined,
+        productImages: validProductImages,
+        referenceImages: validReferenceImages.length > 0 ? validReferenceImages : undefined,
         userPrompt: userPrompt.trim() || undefined,
       })
       agentStartTask(taskId)

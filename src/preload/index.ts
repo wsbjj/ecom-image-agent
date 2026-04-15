@@ -1,6 +1,13 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { IPC_CHANNELS } from '../shared/ipc-channels'
-import type { TaskInput, LoopEvent, TemplateInput, TaskRecord, TemplateRecord } from '../shared/types'
+import type {
+  TaskInput,
+  LoopEvent,
+  TemplateInput,
+  TaskRecord,
+  TemplateRecord,
+  ImageProviderName,
+} from '../shared/types'
 
 const api = {
   startTask: (input: TaskInput): Promise<{ taskId: string }> =>
@@ -38,6 +45,19 @@ const api = {
   }): Promise<{ success: boolean; message: string }> =>
     ipcRenderer.invoke(IPC_CHANNELS.CONFIG_TEST_ANTHROPIC, params),
 
+  testImageProviderConnection: (params: {
+    provider: ImageProviderName
+    apiKey?: string
+    baseUrl?: string
+    model?: string
+    endpointId?: string
+    callMode?: 'visual_official' | 'openai_compat'
+    accessKeyId?: string
+    secretAccessKey?: string
+    reqKey?: string
+  }): Promise<{ success: boolean; message: string; durationMs?: number }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.CONFIG_TEST_IMAGE_PROVIDER, params),
+
   getUserDataPath: (): Promise<{ path: string }> =>
     ipcRenderer.invoke(IPC_CHANNELS.APP_USER_DATA_PATH),
 
@@ -49,6 +69,14 @@ const api = {
 
   deleteTemplate: (id: number): Promise<{ success: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.TEMPLATE_DELETE, id),
+
+  resolveLocalPath: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file)
+    } catch {
+      return ''
+    }
+  },
 }
 
 contextBridge.exposeInMainWorld('api', api)

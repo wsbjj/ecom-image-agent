@@ -52,8 +52,15 @@ export async function runAgentLoop(
     ...(options.anthropicBaseUrl ? { baseURL: options.anthropicBaseUrl } : {}),
   })
 
-  const productImagePaths = input.productImages.map((img) => img.path)
-  const referenceImagePaths = input.referenceImages?.map((img) => img.path)
+  const normalizeImagePaths = (paths: string[]): string[] =>
+    paths
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0)
+
+  const productImagePaths = normalizeImagePaths(input.productImages.map((img) => img.path))
+  const referenceImagePaths = input.referenceImages
+    ? normalizeImagePaths(input.referenceImages.map((img) => img.path))
+    : undefined
   const productImageAngles = input.productImages
     .map((img) => img.angle)
     .filter((a): a is string => Boolean(a))
@@ -150,15 +157,65 @@ export async function runAgentLoop(
         })
 
         try {
+          const normalizedToolInput =
+            block.name === 'generate_image'
+              ? {
+                  ...(block.input as Record<string, unknown>),
+                  // Force using user-uploaded local image paths to prevent model hallucinated paths.
+                  product_image_paths: productImagePaths,
+                  ...(referenceImagePaths?.length
+                    ? { reference_image_paths: referenceImagePaths }
+                    : {}),
+                }
+              : (block.input as Record<string, unknown>)
+
           const result = await mcpServer.callTool(
             block.name,
-            block.input as Record<string, unknown>,
+            normalizedToolInput,
           )
 
           if (block.name === 'generate_image') {
-            const genResult = result as { image_path: string }
+            const genResult = result as {
+              image_path: string
+              debug_info?: {
+                request_id?: string
+                task_id?: string
+                provider_mode?: 'visual_official' | 'openai_compat'
+                fallback_reason?: string
+              }
+            }
             generatedImagePath = genResult.image_path
             lastImagePath = generatedImagePath
+            if (
+              genResult.debug_info?.request_id ||
+              genResult.debug_info?.task_id ||
+              genResult.debug_info?.provider_mode ||
+              genResult.debug_info?.fallback_reason
+            ) {
+              const details = [
+                genResult.debug_info.provider_mode
+                  ? `mode=${genResult.debug_info.provider_mode}`
+                  : null,
+                genResult.debug_info.request_id
+                  ? `request_id=${genResult.debug_info.request_id}`
+                  : null,
+                genResult.debug_info.task_id
+                  ? `task_id=${genResult.debug_info.task_id}`
+                  : null,
+                genResult.debug_info.fallback_reason
+                  ? `fallback=${genResult.debug_info.fallback_reason}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(', ')
+              pushEvent({
+                taskId,
+                phase: 'observe',
+                message: `generate_image 调试信息: ${details}`,
+                retryCount,
+                timestamp: Date.now(),
+              })
+            }
           }
 
           if (block.name === 'evaluate_image') {
@@ -174,6 +231,13 @@ export async function runAgentLoop(
           })
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : String(err)
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message: `${block.name} 执行失败：${errMsg}`,
+            retryCount,
+            timestamp: Date.now(),
+          })
           toolResults.push({
             type: 'tool_result',
             tool_use_id: block.id,
@@ -200,6 +264,35 @@ export async function runAgentLoop(
       })
       await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
       return
+    }
+
+    // Fallback: if model generated image but skipped evaluate_image, run evaluation automatically.
+    if (generatedImagePath && roundEvalScore === null) {
+      try {
+        const evalRes = await mcpServer.callTool('evaluate_image', {
+          image_path: generatedImagePath,
+          product_name: input.productName,
+          context: input.context,
+        }) as { total_score: number; defect_analysis: DefectAnalysis }
+        roundEvalScore = evalRes.total_score
+        roundDefect = evalRes.defect_analysis
+        pushEvent({
+          taskId,
+          phase: 'observe',
+          message: '模型未主动调用 evaluate_image，已自动补充评估',
+          retryCount,
+          timestamp: Date.now(),
+        })
+      } catch (error: unknown) {
+        const errMsg = error instanceof Error ? error.message : String(error)
+        pushEvent({
+          taskId,
+          phase: 'observe',
+          message: `自动评估失败：${errMsg}`,
+          retryCount,
+          timestamp: Date.now(),
+        })
+      }
     }
 
     if (!generatedImagePath || roundEvalScore === null || !roundDefect) {

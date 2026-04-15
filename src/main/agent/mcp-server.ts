@@ -14,6 +14,12 @@ interface GenerateImageInput {
 interface GenerateImageOutput {
   image_path: string
   prompt_used: string
+  debug_info?: {
+    request_id?: string
+    task_id?: string
+    provider_mode?: 'visual_official' | 'openai_compat'
+    fallback_reason?: string
+  }
 }
 
 interface EvaluateImageInput {
@@ -82,16 +88,37 @@ export async function createMcpServer(
 ): Promise<McpServer> {
   const toolHandlers = new Map<string, (input: Record<string, unknown>) => Promise<unknown>>()
 
+  const normalizePathList = (paths: unknown): string[] =>
+    Array.isArray(paths)
+      ? paths
+          .filter((p): p is string => typeof p === 'string')
+          .map((p) => p.trim())
+          .filter((p) => p.length > 0)
+      : []
+
   toolHandlers.set('generate_image', async (rawInput: Record<string, unknown>): Promise<GenerateImageOutput> => {
     const input = rawInput as unknown as GenerateImageInput
+    const productImagePaths = normalizePathList(input.product_image_paths)
+    const referenceImagePaths = normalizePathList(input.reference_image_paths)
     const result = await provider.generate({
       prompt: input.prompt,
       style: input.style,
       aspectRatio: input.aspect_ratio,
-      productImagePaths: input.product_image_paths ?? [],
-      referenceImagePaths: input.reference_image_paths,
+      productImagePaths,
+      referenceImagePaths: referenceImagePaths.length > 0 ? referenceImagePaths : undefined,
     })
-    return { image_path: result.imagePath, prompt_used: result.promptUsed }
+    return {
+      image_path: result.imagePath,
+      prompt_used: result.promptUsed,
+      debug_info: result.debugInfo
+        ? {
+            request_id: result.debugInfo.requestId,
+            task_id: result.debugInfo.taskId,
+            provider_mode: result.debugInfo.providerMode,
+            fallback_reason: result.debugInfo.fallbackReason,
+          }
+        : undefined,
+    }
   })
 
   toolHandlers.set('evaluate_image', async (rawInput: Record<string, unknown>): Promise<EvaluateImageOutput> => {

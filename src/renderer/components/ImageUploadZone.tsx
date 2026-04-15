@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback } from 'react'
 import type { ImageAsset } from '../../shared/types'
+import { toFileUrl } from '../lib/fileUrl'
 
 const ANGLE_OPTIONS = ['front', 'side', 'top', 'detail'] as const
 const ANGLE_LABELS: Record<string, string> = {
@@ -16,6 +17,20 @@ interface ImageUploadZoneProps {
   value: ImageAsset[]
   onChange: (assets: ImageAsset[]) => void
   showAngleTag?: boolean
+}
+
+function resolveAssetPath(file: File): string {
+  const legacyPath = (file as File & { path?: string }).path
+  if (typeof legacyPath === 'string' && legacyPath.trim().length > 0) {
+    return legacyPath.trim()
+  }
+
+  const resolvedPath = window.api.resolveLocalPath(file)
+  if (typeof resolvedPath === 'string' && resolvedPath.trim().length > 0) {
+    return resolvedPath.trim()
+  }
+
+  return ''
 }
 
 export function ImageUploadZone({
@@ -35,15 +50,23 @@ export function ImageUploadZone({
       const remaining = maxFiles - value.length
       if (remaining <= 0) return
 
-      const newAssets: ImageAsset[] = fileArray
+      const nextFiles = fileArray
         .filter((f) => f.type.startsWith('image/'))
         .slice(0, remaining)
-        .map((f) => ({
-          path: (f as File & { path: string }).path,
-          angle: undefined,
-          isPrimary: value.length === 0,
-        }))
 
+      const hasPrimary = value.some((asset) => asset.isPrimary)
+      const newAssets: ImageAsset[] = []
+      for (const f of nextFiles) {
+        const localPath = resolveAssetPath(f)
+        if (!localPath) continue
+        newAssets.push({
+          path: localPath,
+          angle: undefined,
+          isPrimary: !hasPrimary && newAssets.length === 0,
+        })
+      }
+
+      if (newAssets.length === 0) return
       onChange([...value, ...newAssets])
     },
     [value, maxFiles, onChange],
@@ -138,7 +161,7 @@ export function ImageUploadZone({
             {value.map((asset, i) => (
               <div key={asset.path} className="relative group">
                 <img
-                  src={`file://${asset.path}`}
+                  src={toFileUrl(asset.path)}
                   alt={`${label} ${i + 1}`}
                   className="w-full aspect-square object-cover rounded-md border border-gray-700"
                 />
