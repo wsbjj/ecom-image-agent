@@ -40,20 +40,34 @@ describe('shared types structure', () => {
         phase,
         message: `Phase: ${phase}`,
         retryCount: 0,
+        roundIndex: 0,
         timestamp: Date.now(),
       }
       expect(event.phase).toBe(phase)
     })
   })
 
-  it('should export DefectAnalysis with three dimensions', () => {
+  it('should export DefectAnalysis with dynamic dimensions', () => {
     const defect = {
-      edge_distortion: { score: 25, issues: ['test'] },
-      perspective_lighting: { score: 28, issues: [] },
-      hallucination: { score: 30, issues: [] },
+      dimensions: [
+        {
+          key: 'edge_distortion',
+          name: '边缘畸变',
+          score: 25,
+          maxScore: 30,
+          issues: ['test'],
+        },
+        {
+          key: 'perspective_lighting',
+          name: '透视与光影',
+          score: 28,
+          maxScore: 30,
+          issues: [],
+        },
+      ],
       overall_recommendation: 'good',
     }
-    expect(defect.edge_distortion.score).toBe(25)
-    expect(defect.perspective_lighting.issues).toHaveLength(0)
+    expect(defect.dimensions[0].score).toBe(25)
+    expect(defect.dimensions[1].issues).toHaveLength(0)
   })
 })

@@ -14,7 +14,7 @@ export function MonacoPane({
   onChange,
   language = 'json',
   readOnly = false,
-}: MonacoPaneProps): JSX.Element {
+}: MonacoPaneProps) {
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null)
 
   const handleMount: OnMount = useCallback((ed) => {

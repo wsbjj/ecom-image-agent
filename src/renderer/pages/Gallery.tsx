@@ -2,7 +2,7 @@ import { useEffect, useMemo } from 'react'
 import { useTaskStore } from '../store/task.store'
 import { ImageCard } from '../components/ImageCard'
 
-export function Gallery(): JSX.Element {
+export function Gallery() {
   const { tasks, isLoading, fetchTasks } = useTaskStore()
 
   useEffect(() => {

@@ -12,8 +12,18 @@ import {
   insertTemplate,
   listTemplates,
   deleteTemplate,
+  insertEvaluationTemplate,
+  listEvaluationTemplates,
+  deleteEvaluationTemplate,
+  ensureDefaultEvaluationTemplate,
 } from '../db/queries'
-import type { TemplateInput, TemplateRecord, ImageProviderName } from '../../shared/types'
+import type {
+  TemplateInput,
+  TemplateRecord,
+  ImageProviderName,
+  EvaluationTemplateInput,
+  EvaluationTemplateRecord,
+} from '../../shared/types'
 
 async function getOptionalDecryptedValue(key: string): Promise<string | undefined> {
   const val = await getConfigValue(key)
@@ -294,6 +304,36 @@ export function registerConfigHandlers(): void {
     async (_event, id: number): Promise<{ success: boolean }> => {
       await deleteTemplate(id)
       return { success: true }
+    },
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.EVAL_TEMPLATE_SAVE,
+    async (_event, template: EvaluationTemplateInput): Promise<{ success: boolean }> => {
+      await insertEvaluationTemplate(template)
+      return { success: true }
+    },
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.EVAL_TEMPLATE_LIST,
+    async (): Promise<EvaluationTemplateRecord[]> => {
+      return listEvaluationTemplates()
+    },
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.EVAL_TEMPLATE_DELETE,
+    async (_event, id: number): Promise<{ success: boolean }> => {
+      await deleteEvaluationTemplate(id)
+      return { success: true }
+    },
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_STANDARD,
+    async (): Promise<EvaluationTemplateRecord> => {
+      return ensureDefaultEvaluationTemplate()
     },
   )
 }

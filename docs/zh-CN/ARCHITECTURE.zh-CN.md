@@ -53,8 +53,8 @@
 
 关键常量：
 
-- `MAX_RETRIES = 3`
-- `SCORE_THRESHOLD = 85`
+- `MAX_RETRIES` 默认 `3`（可通过 Settings 保存 `AGENT_MAX_RETRIES` 覆盖，范围 `0~10`）
+- `SCORE_THRESHOLD` 默认 `85`（可通过 Settings 保存 `AGENT_SCORE_THRESHOLD` 覆盖，范围 `0~100`）
 - 输入 token 成本：`3 / 1_000_000`
 - 输出 token 成本：`15 / 1_000_000`
 

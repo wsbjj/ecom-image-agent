@@ -43,7 +43,9 @@ export class SeedreamProvider implements ImageProvider {
   }
 
   async generate(params: GenerateImageParams): Promise<GenerateImageResult> {
-    const hasProductImages = params.productImagePaths.length > 0
+    const productCount = params.productImagePaths.length
+    const referenceCount = params.referenceImagePaths?.length ?? 0
+    const hasInputImages = productCount + referenceCount > 0
     const size = ASPECT_TO_SIZE[params.aspectRatio ?? '1:1'] ?? '1024x1024'
 
     const fullPrompt = `${params.prompt}${params.style ? `, style: ${params.style}` : ''}, e-commerce product photography, high quality, commercial grade`
@@ -51,10 +53,11 @@ export class SeedreamProvider implements ImageProvider {
     let imageUrl: string
     let usedModel: string
 
-    if (hasProductImages) {
+    if (hasInputImages) {
       const generated = await this.generateWithReference(
         fullPrompt,
-        params.productImagePaths[0],
+        params.productImagePaths,
+        params.referenceImagePaths ?? [],
         size,
       )
       imageUrl = generated.imageUrl
@@ -83,6 +86,8 @@ export class SeedreamProvider implements ImageProvider {
       promptUsed: fullPrompt,
       debugInfo: {
         providerMode: 'openai_compat',
+        productImageCount: productCount,
+        referenceImageCount: referenceCount,
         ...(usedModel !== this.modelId
           ? {
               fallbackReason: `模型 ${this.modelId} 不支持当前 API，已自动回退到 ${usedModel}`,
@@ -182,20 +187,42 @@ export class SeedreamProvider implements ImageProvider {
 
   private async generateWithReference(
     prompt: string,
-    refImagePath: string,
+    productImagePaths: string[],
+    referenceImagePaths: string[],
     size: string,
   ): Promise<{ imageUrl: string; model: string }> {
-    const imageData = await fs.readFile(refImagePath)
-    const base64 = imageData.toString('base64')
-    const ext = path.extname(refImagePath).toLowerCase()
-    const mimeMap: Record<string, string> = {
-      '.png': 'image/png',
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.webp': 'image/webp',
+    const toImagePart = async (
+      imagePath: string,
+    ): Promise<{ type: 'image_url'; image_url: { url: string } }> => {
+      const imageData = await fs.readFile(imagePath)
+      const base64 = imageData.toString('base64')
+      const ext = path.extname(imagePath).toLowerCase()
+      const mimeMap: Record<string, string> = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.webp': 'image/webp',
+      }
+      const mime = mimeMap[ext] ?? 'image/png'
+      const dataUri = `data:${mime};base64,${base64}`
+      return {
+        type: 'image_url',
+        image_url: { url: dataUri },
+      }
     }
-    const mime = mimeMap[ext] ?? 'image/png'
-    const dataUri = `data:${mime};base64,${base64}`
+
+    const productParts = await Promise.all(productImagePaths.map((imagePath) => toImagePart(imagePath)))
+    const referenceParts = await Promise.all(
+      referenceImagePaths.map((imagePath) => toImagePart(imagePath)),
+    )
+    const roleInstruction = [
+      `Use all ${productImagePaths.length} product images as the primary source of product identity, shape, and materials.`,
+      referenceImagePaths.length > 0
+        ? `Use all ${referenceImagePaths.length} reference images only for style, color tone, composition, and lighting.`
+        : 'No style reference images are provided.',
+      `Generate one e-commerce image with size ${size}.`,
+      `Prompt: ${prompt}`,
+    ].join(' ')
 
     const modelCandidates = this.buildModelCandidates()
     let lastError: unknown
@@ -208,13 +235,11 @@ export class SeedreamProvider implements ImageProvider {
             {
               role: 'user',
               content: [
-                {
-                  type: 'image_url',
-                  image_url: { url: dataUri },
-                },
+                ...productParts,
+                ...referenceParts,
                 {
                   type: 'text',
-                  text: `Based on this product image, generate a professional e-commerce product photo: ${prompt}. Output image size: ${size}`,
+                  text: roleInstruction,
                 },
               ],
             },

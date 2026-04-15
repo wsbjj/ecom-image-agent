@@ -15,6 +15,29 @@ function parseDefects(raw: string | null): DefectAnalysis | null {
   }
 }
 
+function defectIssuePreview(defects: DefectAnalysis): string[] {
+  if (Array.isArray(defects.dimensions) && defects.dimensions.length > 0) {
+    return defects.dimensions
+      .flatMap((dimension) =>
+        dimension.issues.slice(0, 1).map((issue) => `${dimension.name}: ${issue}`),
+      )
+      .slice(0, 2)
+  }
+
+  if (defects.legacy) {
+    const result: string[] = []
+    if (defects.legacy.edge_distortion.issues.length > 0) {
+      result.push(`边缘: ${defects.legacy.edge_distortion.issues[0]}`)
+    }
+    if (defects.legacy.perspective_lighting.issues.length > 0) {
+      result.push(`光影: ${defects.legacy.perspective_lighting.issues[0]}`)
+    }
+    return result.slice(0, 2)
+  }
+
+  return []
+}
+
 function getStatusColor(status: TaskRecord['status']): string {
   switch (status) {
     case 'success':
@@ -41,8 +64,15 @@ function getStatusLabel(status: TaskRecord['status']): string {
   }
 }
 
-export function ImageCard({ task }: ImageCardProps): JSX.Element {
+function scoreBarColor(status: TaskRecord['status']): string {
+  if (status === 'success') return 'bg-emerald-500'
+  if (status === 'failed') return 'bg-amber-500'
+  return 'bg-blue-500'
+}
+
+export function ImageCard({ task }: ImageCardProps) {
   const defects = parseDefects(task.defect_analysis)
+  const issuePreview = defects ? defectIssuePreview(defects) : []
   const [imageSrc, setImageSrc] = useState<string | null>(
     task.image_path ? toFileUrl(task.image_path) : null,
   )
@@ -106,9 +136,7 @@ export function ImageCard({ task }: ImageCardProps): JSX.Element {
           <div className="flex items-center gap-2">
             <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
               <div
-                className={`h-full rounded-full transition-all ${
-                  task.total_score >= 85 ? 'bg-emerald-500' : 'bg-amber-500'
-                }`}
+                className={`h-full rounded-full transition-all ${scoreBarColor(task.status)}`}
                 role="progressbar"
                 aria-valuenow={task.total_score}
                 aria-valuemin={0}
@@ -122,14 +150,11 @@ export function ImageCard({ task }: ImageCardProps): JSX.Element {
           </div>
         )}
 
-        {defects && (
+        {defects && issuePreview.length > 0 && (
           <div className="text-xs text-gray-500 space-y-0.5">
-            {defects.edge_distortion.issues.length > 0 && (
-              <div>边缘: {defects.edge_distortion.issues[0]}</div>
-            )}
-            {defects.perspective_lighting.issues.length > 0 && (
-              <div>光影: {defects.perspective_lighting.issues[0]}</div>
-            )}
+            {issuePreview.map((line, index) => (
+              <div key={`${task.task_id}-defect-${index}`}>{line}</div>
+            ))}
           </div>
         )}
 

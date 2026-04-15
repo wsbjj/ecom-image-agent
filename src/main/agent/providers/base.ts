@@ -14,7 +14,11 @@ export interface GenerateImageResult {
     requestId?: string
     taskId?: string
     providerMode?: 'visual_official' | 'openai_compat'
+    visualRoute?: 't2i' | 'i2i'
     fallbackReason?: string
+    productImageCount?: number
+    referenceImageCount?: number
+    usedCompositeImage?: boolean
   }
 }
 

@@ -66,7 +66,7 @@ function parseJson(text: string): TaskInput[] {
   }))
 }
 
-export function CsvImporter({ onImport }: CsvImporterProps): JSX.Element {
+export function CsvImporter({ onImport }: CsvImporterProps) {
   const [error, setError] = useState<string | null>(null)
   const [preview, setPreview] = useState<TaskInput[]>([])
 

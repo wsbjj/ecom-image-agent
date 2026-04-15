@@ -7,6 +7,9 @@ import type {
   TaskRecord,
   TemplateRecord,
   ImageProviderName,
+  EvaluationTemplateInput,
+  EvaluationTemplateRecord,
+  TaskRoundArtifactRecord,
 } from '../shared/types'
 
 const api = {
@@ -16,8 +19,10 @@ const api = {
   stopTask: (taskId: string): Promise<{ success: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.TASK_STOP, taskId),
 
-  queryTasks: (): Promise<TaskRecord[]> =>
-    ipcRenderer.invoke(IPC_CHANNELS.TASK_LIST),
+  queryTasks: (): Promise<TaskRecord[]> => ipcRenderer.invoke(IPC_CHANNELS.TASK_LIST),
+
+  queryTaskRoundArtifacts: (taskId: string): Promise<TaskRoundArtifactRecord[]> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_ROUND_ARTIFACTS, taskId),
 
   onAgentEvent: (callback: (event: LoopEvent) => void): (() => void) => {
     const handler = (_: Electron.IpcRendererEvent, event: LoopEvent): void => {
@@ -67,11 +72,23 @@ const api = {
   saveTemplate: (template: TemplateInput): Promise<{ success: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.TEMPLATE_SAVE, template),
 
-  listTemplates: (): Promise<TemplateRecord[]> =>
-    ipcRenderer.invoke(IPC_CHANNELS.TEMPLATE_LIST),
+  listTemplates: (): Promise<TemplateRecord[]> => ipcRenderer.invoke(IPC_CHANNELS.TEMPLATE_LIST),
 
   deleteTemplate: (id: number): Promise<{ success: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.TEMPLATE_DELETE, id),
+
+  saveEvaluationTemplate: (
+    template: EvaluationTemplateInput,
+  ): Promise<{ success: boolean }> => ipcRenderer.invoke(IPC_CHANNELS.EVAL_TEMPLATE_SAVE, template),
+
+  listEvaluationTemplates: (): Promise<EvaluationTemplateRecord[]> =>
+    ipcRenderer.invoke(IPC_CHANNELS.EVAL_TEMPLATE_LIST),
+
+  deleteEvaluationTemplate: (id: number): Promise<{ success: boolean }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.EVAL_TEMPLATE_DELETE, id),
+
+  generateStandardEvaluationTemplate: (): Promise<EvaluationTemplateRecord> =>
+    ipcRenderer.invoke(IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_STANDARD),
 
   resolveLocalPath: (file: File): string => {
     try {

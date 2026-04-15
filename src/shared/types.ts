@@ -1,8 +1,30 @@
-export interface DefectAnalysis {
+export interface LegacyDefectAnalysis {
   edge_distortion: { score: number; issues: string[] }
   perspective_lighting: { score: number; issues: string[] }
   hallucination: { score: number; issues: string[] }
+}
+
+export interface EvalDimensionResult {
+  key: string
+  name: string
+  score: number
+  maxScore: number
+  issues: string[]
+  reason?: string
+  weight?: number
+}
+
+export interface DefectAnalysis {
+  dimensions: EvalDimensionResult[]
   overall_recommendation: string
+  summary?: string
+  legacy?: LegacyDefectAnalysis
+}
+
+export interface ContextUsageSnapshot {
+  totalTokens: number
+  maxTokens: number
+  percentage: number
 }
 
 export interface LoopEvent {
@@ -12,6 +34,10 @@ export interface LoopEvent {
   score?: number
   defectAnalysis?: DefectAnalysis
   retryCount: number
+  roundIndex: number
+  generatedImagePath?: string
+  previewImagePath?: string
+  contextUsage?: ContextUsageSnapshot
   costUsd?: number
   timestamp: number
 }
@@ -23,6 +49,7 @@ export interface ImageAsset {
 }
 
 export type ImageProviderName = 'gemini' | 'seedream'
+export type AgentEngineName = 'claude_sdk' | 'legacy'
 
 export interface TaskInput {
   skuId: string
@@ -33,6 +60,21 @@ export interface TaskInput {
   productImages: ImageAsset[]
   referenceImages?: ImageAsset[]
   userPrompt?: string
+  evaluationTemplateId?: number
+  scoreThresholdOverride?: number
+}
+
+export interface EvalRubricDimension {
+  key: string
+  name: string
+  maxScore: number
+  weight: number
+  description: string
+}
+
+export interface EvalRubric {
+  dimensions: EvalRubricDimension[]
+  scoringNotes?: string
 }
 
 export interface EvalRequest {
@@ -40,11 +82,15 @@ export interface EvalRequest {
   imagePath: string
   productName: string
   context: string
+  rubric: EvalRubric
+  passThreshold: number
 }
 
 export interface EvalResult {
   totalScore: number
   defectAnalysis: DefectAnalysis
+  passed: boolean
+  passThreshold: number
 }
 
 export interface TaskRecord {
@@ -65,6 +111,18 @@ export interface TaskRecord {
   updated_at: string | null
 }
 
+export interface TaskRoundArtifactRecord {
+  id: number
+  task_id: string
+  round_index: number
+  generated_image_path: string
+  preview_image_path: string | null
+  context_thumb_path: string | null
+  score: number | null
+  context_usage: string | null
+  created_at: string
+}
+
 export interface TemplateRecord {
   id: number
   name: string
@@ -79,4 +137,20 @@ export interface TemplateInput {
   style: string
   lighting: string
   system_prompt: string
+}
+
+export interface EvaluationTemplateRecord {
+  id: number
+  name: string
+  version: number
+  default_threshold: number
+  rubric_json: string
+  created_at: string
+}
+
+export interface EvaluationTemplateInput {
+  name: string
+  version: number
+  defaultThreshold: number
+  rubric: EvalRubric
 }

@@ -4,7 +4,7 @@ import { useTaskStore } from '../store/task.store'
 import { TaskTable } from '../components/TaskTable'
 import type { TaskRecord } from '../../shared/types'
 
-export function Dashboard(): JSX.Element {
+export function Dashboard() {
   const { tasks, isLoading, filter, fetchTasks, setFilter } = useTaskStore()
   const navigate = useNavigate()
 

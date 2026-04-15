@@ -8,15 +8,28 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import sys
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
 import anthropic
+from pydantic import BaseModel, Field, ValidationError
 
-from judge_prompt import JUDGE_SYSTEM_PROMPT
+from judge_prompt import build_judge_system_prompt
+
+
+class RubricDimension(BaseModel):
+    key: str
+    name: str
+    maxScore: int = Field(ge=1, le=100)
+    weight: float = Field(ge=0)
+    description: str
+
+
+class Rubric(BaseModel):
+    dimensions: list[RubricDimension]
+    scoringNotes: str | None = None
 
 
 class EvalRequest(BaseModel):
@@ -24,23 +37,31 @@ class EvalRequest(BaseModel):
     image_path: str
     product_name: str
     context: str
+    rubric: Rubric
+    pass_threshold: int = Field(ge=0, le=100)
 
 
 class DimensionScore(BaseModel):
-    score: int = Field(ge=0, le=30)
+    key: str
+    name: str
+    score: int = Field(ge=0, le=100)
+    maxScore: int = Field(ge=1, le=100)
+    weight: float = Field(ge=0)
     issues: list[str]
+    reason: str = ""
 
 
 class DefectAnalysis(BaseModel):
-    edge_distortion: DimensionScore
-    perspective_lighting: DimensionScore
-    hallucination: DimensionScore
+    dimensions: list[DimensionScore]
     overall_recommendation: str
+    summary: str | None = None
 
 
 class EvalResponse(BaseModel):
     request_id: str
     total_score: int
+    pass_threshold: int
+    passed: bool
     defect_analysis: DefectAnalysis
 
 
@@ -58,6 +79,67 @@ def load_env_file(env_path: Path) -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+def _extract_json_block(raw_text: str) -> dict[str, Any]:
+    start = raw_text.find("{")
+    end = raw_text.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError(f"模型未返回有效 JSON: {raw_text[:200]}")
+    return json.loads(raw_text[start:end])
+
+
+def _normalize_dimensions(
+    raw_dimensions: list[dict[str, Any]],
+    rubric_dimensions: list[RubricDimension],
+) -> list[DimensionScore]:
+    by_key: dict[str, dict[str, Any]] = {}
+    for item in raw_dimensions:
+        key = str(item.get("key", "")).strip()
+        if key:
+            by_key[key] = item
+    normalized: list[DimensionScore] = []
+
+    for dim in rubric_dimensions:
+        raw = by_key.get(dim.key, {})
+        score = int(raw.get("score", 0))
+        score = max(0, min(dim.maxScore, score))
+
+        issues = raw.get("issues", [])
+        if not isinstance(issues, list):
+            issues = []
+
+        normalized.append(
+            DimensionScore(
+                key=dim.key,
+                name=dim.name,
+                score=score,
+                maxScore=dim.maxScore,
+                weight=dim.weight,
+                issues=[str(item) for item in issues if str(item).strip()],
+                reason=str(raw.get("reason", "")),
+            )
+        )
+
+    return normalized
+
+
+def _compute_total_score(dimensions: list[DimensionScore]) -> int:
+    if len(dimensions) == 0:
+        return 0
+
+    denominator = sum(item.maxScore * item.weight for item in dimensions)
+    numerator = sum(item.score * item.weight for item in dimensions)
+
+    if denominator <= 0:
+        denominator = sum(item.maxScore for item in dimensions)
+        numerator = sum(item.score for item in dimensions)
+
+    if denominator <= 0:
+        return 0
+
+    weighted = (numerator / denominator) * 100
+    return int(round(max(0, min(100, weighted))))
 
 
 def evaluate_image(
@@ -80,11 +162,13 @@ def evaluate_image(
     }
     media_type = media_type_map.get(suffix, "image/png")
 
+    prompt = build_judge_system_prompt(request.rubric.model_dump())
+
     message = client.messages.create(
         model=model_name,
         max_tokens=1024,
         temperature=0,
-        system=JUDGE_SYSTEM_PROMPT,
+        system=prompt,
         messages=[
             {
                 "role": "user",
@@ -100,7 +184,7 @@ def evaluate_image(
                     {
                         "type": "text",
                         "text": (
-                            f"请评估此电商图片。"
+                            "请评估此电商图片。"
                             f"商品名称：{request.product_name}，"
                             f"拍摄场景：{request.context}"
                         ),
@@ -111,30 +195,30 @@ def evaluate_image(
     )
 
     raw_text = message.content[0].text.strip()
-    start = raw_text.find("{")
-    end = raw_text.rfind("}") + 1
-    if start == -1 or end == 0:
-        raise ValueError(f"模型未返回有效 JSON: {raw_text[:200]}")
+    raw_json = _extract_json_block(raw_text)
 
-    raw_json: dict[str, Any] = json.loads(raw_text[start:end])
+    raw_dimensions = raw_json.get("dimensions", [])
+    if not isinstance(raw_dimensions, list):
+        raw_dimensions = []
 
-    overall_score: int = raw_json.get("overall_score", 5)
-    defect = DefectAnalysis(
-        edge_distortion=DimensionScore(**raw_json["edge_distortion"]),
-        perspective_lighting=DimensionScore(**raw_json["perspective_lighting"]),
-        hallucination=DimensionScore(**raw_json["hallucination"]),
-        overall_recommendation=raw_json.get("overall_recommendation", ""),
+    normalized_dimensions = _normalize_dimensions(
+        [item for item in raw_dimensions if isinstance(item, dict)],
+        request.rubric.dimensions,
     )
-    total = (
-        defect.edge_distortion.score
-        + defect.perspective_lighting.score
-        + defect.hallucination.score
-        + overall_score
+
+    total_score = _compute_total_score(normalized_dimensions)
+
+    defect = DefectAnalysis(
+        dimensions=normalized_dimensions,
+        overall_recommendation=str(raw_json.get("overall_recommendation", "")),
+        summary=str(raw_json.get("summary", "")) if raw_json.get("summary") is not None else None,
     )
 
     return EvalResponse(
         request_id=request.request_id,
-        total_score=min(total, 100),
+        total_score=total_score,
+        pass_threshold=request.pass_threshold,
+        passed=total_score >= request.pass_threshold,
         defect_analysis=defect,
     )
 
@@ -147,7 +231,6 @@ def main() -> None:
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    # 支持从脚本同目录 .env 读取配置，便于本地直接运行
     load_env_file(Path(__file__).resolve().parent / ".env")
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -162,6 +245,7 @@ def main() -> None:
         client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
     else:
         client = anthropic.Anthropic(api_key=api_key)
+
     sys.stderr.write(f"[VLMEval] 使用模型: {model_name}\n")
     sys.stderr.write("[VLMEval] 服务启动，等待请求...\n")
     sys.stderr.flush()

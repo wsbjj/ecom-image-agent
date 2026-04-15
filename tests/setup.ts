@@ -5,6 +5,7 @@ const mockApi = {
   startTask: vi.fn().mockResolvedValue({ taskId: 'test-task-id' }),
   stopTask: vi.fn().mockResolvedValue({ success: true }),
   queryTasks: vi.fn().mockResolvedValue([]),
+  queryTaskRoundArtifacts: vi.fn().mockResolvedValue([]),
   onAgentEvent: vi.fn().mockReturnValue(() => {}),
   saveConfig: vi.fn().mockResolvedValue({ success: true }),
   checkConfig: vi.fn().mockResolvedValue({ exists: false }),
@@ -17,6 +18,17 @@ const mockApi = {
   saveTemplate: vi.fn().mockResolvedValue({ success: true }),
   listTemplates: vi.fn().mockResolvedValue([]),
   deleteTemplate: vi.fn().mockResolvedValue({ success: true }),
+  saveEvaluationTemplate: vi.fn().mockResolvedValue({ success: true }),
+  listEvaluationTemplates: vi.fn().mockResolvedValue([]),
+  deleteEvaluationTemplate: vi.fn().mockResolvedValue({ success: true }),
+  generateStandardEvaluationTemplate: vi.fn().mockResolvedValue({
+    id: 1,
+    name: '默认电商评估标准',
+    version: 1,
+    default_threshold: 85,
+    rubric_json: '{}',
+    created_at: new Date().toISOString(),
+  }),
 }
 
 Object.defineProperty(window, 'api', {

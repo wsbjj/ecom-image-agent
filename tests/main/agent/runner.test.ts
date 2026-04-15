@@ -7,6 +7,7 @@ describe('buildSystemPrompt', () => {
     productName: '北欧陶瓷杯',
     context: '侧逆光极简白底场景',
     retryCount: 0,
+    scoreThreshold: 85,
   }
 
   it('should return base prompt without defect section on first run', () => {
@@ -20,9 +21,22 @@ describe('buildSystemPrompt', () => {
 
   it('should include defect analysis on retry', () => {
     const defects: DefectAnalysis = {
-      edge_distortion: { score: 20, issues: ['边缘模糊'] },
-      perspective_lighting: { score: 25, issues: ['光影方向不一致'] },
-      hallucination: { score: 28, issues: [] },
+      dimensions: [
+        {
+          key: 'edge_distortion',
+          name: '边缘畸变',
+          score: 20,
+          maxScore: 30,
+          issues: ['边缘模糊'],
+        },
+        {
+          key: 'perspective_lighting',
+          name: '透视与光影',
+          score: 25,
+          maxScore: 30,
+          issues: ['光影方向不一致'],
+        },
+      ],
       overall_recommendation: '建议增加边缘清晰度',
     }
     const prompt = buildSystemPrompt({
@@ -39,9 +53,15 @@ describe('buildSystemPrompt', () => {
 
   it('should show "无问题" when issues array is empty', () => {
     const defects: DefectAnalysis = {
-      edge_distortion: { score: 30, issues: [] },
-      perspective_lighting: { score: 30, issues: [] },
-      hallucination: { score: 30, issues: [] },
+      dimensions: [
+        {
+          key: 'edge_distortion',
+          name: '边缘畸变',
+          score: 30,
+          maxScore: 30,
+          issues: [],
+        },
+      ],
       overall_recommendation: '完美',
     }
     const prompt = buildSystemPrompt({

@@ -14,7 +14,7 @@ function formatDate(dateStr: string): string {
   })
 }
 
-function statusBadge(status: TaskRecord['status']): JSX.Element {
+function statusBadge(status: TaskRecord['status']) {
   const styles: Record<TaskRecord['status'], string> = {
     pending: 'bg-gray-500/20 text-gray-400',
     running: 'bg-blue-500/20 text-blue-400',
@@ -34,7 +34,13 @@ function statusBadge(status: TaskRecord['status']): JSX.Element {
   )
 }
 
-export function TaskTable({ tasks, onSelect }: TaskTableProps): JSX.Element {
+function scoreTextColor(task: TaskRecord): string {
+  if (task.status === 'success') return 'text-emerald-400'
+  if (task.status === 'failed') return 'text-amber-400'
+  return 'text-gray-300'
+}
+
+export function TaskTable({ tasks, onSelect }: TaskTableProps) {
   if (tasks.length === 0) {
     return (
       <div className="flex items-center justify-center py-12 text-gray-500">
@@ -71,11 +77,7 @@ export function TaskTable({ tasks, onSelect }: TaskTableProps): JSX.Element {
               <td className="py-3 px-4 text-center">
                 {task.total_score !== null ? (
                   <span
-                    className={`font-mono font-medium ${
-                      task.total_score >= 85
-                        ? 'text-emerald-400'
-                        : 'text-amber-400'
-                    }`}
+                    className={`font-mono font-medium ${scoreTextColor(task)}`}
                   >
                     {task.total_score}
                   </span>

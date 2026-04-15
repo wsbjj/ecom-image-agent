@@ -14,7 +14,7 @@ const COLOR = {
   reset: '\x1b[0m',
 } as const satisfies Record<LoopEvent['phase'] | 'reset', string>
 
-export function TerminalPane(): JSX.Element {
+export function TerminalPane() {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const handleLoopEvent = useAgentStore((s) => s.handleLoopEvent)
@@ -88,10 +88,15 @@ export function TerminalPane(): JSX.Element {
         const color = COLOR[event.phase]
         const ts = new Date(event.timestamp).toLocaleTimeString()
         term.writeln(
-          `${color}[${ts}] [${event.phase.toUpperCase()}] ${event.message}${COLOR.reset}`,
+          `${color}[${ts}] [${event.phase.toUpperCase()}] [第 ${event.roundIndex + 1} 轮] ${event.message}${COLOR.reset}`,
         )
         if (event.score !== undefined) {
           term.writeln(`  → 评分: \x1b[1m${event.score}/100\x1b[0m`)
+        }
+        if (event.contextUsage) {
+          term.writeln(
+            `  → 上下文: ${event.contextUsage.totalTokens}/${event.contextUsage.maxTokens} (${event.contextUsage.percentage.toFixed(1)}%)`,
+          )
         }
         if (event.costUsd !== undefined) {
           term.writeln(`  → 累计费用: $${event.costUsd.toFixed(4)}`)

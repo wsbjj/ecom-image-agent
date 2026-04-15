@@ -2,14 +2,26 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:chil
 import * as readline from 'node:readline'
 import * as path from 'node:path'
 import { app } from 'electron'
-import type { EvalRequest, EvalResult, DefectAnalysis } from '../../shared/types'
+import type {
+  EvalRequest,
+  EvalResult,
+  DefectAnalysis,
+  EvalRubric,
+  EvalDimensionResult,
+} from '../../shared/types'
 
 export type { EvalRequest, EvalResult }
 
 interface RawStdoutLine {
   request_id: string
   total_score: number
-  defect_analysis: DefectAnalysis
+  defect_analysis: {
+    dimensions: EvalDimensionResult[]
+    overall_recommendation: string
+    summary?: string
+  }
+  pass_threshold?: number
+  passed?: boolean
   error?: string
 }
 
@@ -20,6 +32,22 @@ interface PendingResolver {
 }
 
 const EVAL_TIMEOUT_MS = 120_000
+
+function buildLegacyView(dimensions: EvalDimensionResult[]): DefectAnalysis['legacy'] {
+  const find = (key: string): { score: number; issues: string[] } => {
+    const dim = dimensions.find((item) => item.key === key)
+    return {
+      score: dim?.score ?? 0,
+      issues: dim?.issues ?? [],
+    }
+  }
+
+  return {
+    edge_distortion: find('edge_distortion'),
+    perspective_lighting: find('perspective_lighting'),
+    hallucination: find('hallucination'),
+  }
+}
 
 export class VLMEvalBridge {
   private proc: ChildProcessWithoutNullStreams | null = null
@@ -36,12 +64,9 @@ export class VLMEvalBridge {
     const requirementsPath = path.join(appPath, 'python', 'requirements.txt')
     const workDir = app.getPath('userData')
 
-    // Ensure required Python packages exist before starting JSONL service.
-    const checkDeps = spawnSync(
-      pythonPath,
-      ['-X', 'utf8', '-c', 'import anthropic, pydantic'],
-      { encoding: 'utf8' },
-    )
+    const checkDeps = spawnSync(pythonPath, ['-X', 'utf8', '-c', 'import anthropic, pydantic'], {
+      encoding: 'utf8',
+    })
     if (checkDeps.status !== 0) {
       const installDeps = spawnSync(
         pythonPath,
@@ -61,9 +86,7 @@ export class VLMEvalBridge {
         PYTHONUTF8: '1',
         PYTHONIOENCODING: 'utf-8',
         ANTHROPIC_API_KEY: anthropicApiKey,
-        ...(options?.anthropicBaseUrl
-          ? { ANTHROPIC_BASE_URL: options.anthropicBaseUrl }
-          : {}),
+        ...(options?.anthropicBaseUrl ? { ANTHROPIC_BASE_URL: options.anthropicBaseUrl } : {}),
         ...(options?.anthropicModel ? { ANTHROPIC_MODEL: options.anthropicModel } : {}),
       },
     })
@@ -96,18 +119,32 @@ export class VLMEvalBridge {
     } catch {
       return
     }
+
     const pending = this.pendingRequests.get(raw.request_id)
     if (!pending) return
     clearTimeout(pending.timer)
     this.pendingRequests.delete(raw.request_id)
+
     if (raw.error) {
       pending.reject(new Error(raw.error))
-    } else {
-      pending.resolve({
-        totalScore: raw.total_score,
-        defectAnalysis: raw.defect_analysis,
-      })
+      return
     }
+
+    const dimensions = Array.isArray(raw.defect_analysis?.dimensions)
+      ? raw.defect_analysis.dimensions
+      : []
+
+    pending.resolve({
+      totalScore: raw.total_score,
+      defectAnalysis: {
+        dimensions,
+        overall_recommendation: raw.defect_analysis?.overall_recommendation ?? '',
+        summary: raw.defect_analysis?.summary,
+        legacy: buildLegacyView(dimensions),
+      },
+      passed: Boolean(raw.passed ?? false),
+      passThreshold: Number.isFinite(raw.pass_threshold) ? Number(raw.pass_threshold) : 85,
+    })
   }
 
   evaluate(req: EvalRequest): Promise<EvalResult> {
@@ -128,6 +165,8 @@ export class VLMEvalBridge {
         image_path: req.imagePath,
         product_name: req.productName,
         context: req.context,
+        rubric: req.rubric,
+        pass_threshold: req.passThreshold,
       })
       this.proc!.stdin.write(payload + '\n')
     })
@@ -145,5 +184,20 @@ export class VLMEvalBridge {
       pending.reject(new Error('VLMEval bridge stopped'))
       this.pendingRequests.delete(id)
     }
+  }
+}
+
+export function normalizeRubricForJudge(rubric: EvalRubric): EvalRubric {
+  const dimensions = rubric.dimensions
+    .filter((item) => item.maxScore > 0)
+    .map((item) => ({
+      ...item,
+      maxScore: Math.max(1, Math.floor(item.maxScore)),
+      weight: Number.isFinite(item.weight) ? Math.max(0, item.weight) : 0,
+    }))
+
+  return {
+    dimensions,
+    scoringNotes: rubric.scoringNotes,
   }
 }

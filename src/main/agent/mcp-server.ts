@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid'
 import type { VLMEvalBridge } from './vlmeval-bridge'
-import type { DefectAnalysis } from '../../shared/types'
+import type { DefectAnalysis, EvalRubric } from '../../shared/types'
 import type { ImageProvider } from './providers/base'
 
 interface GenerateImageInput {
@@ -18,7 +18,11 @@ interface GenerateImageOutput {
     request_id?: string
     task_id?: string
     provider_mode?: 'visual_official' | 'openai_compat'
+    visual_route?: 't2i' | 'i2i'
     fallback_reason?: string
+    product_image_count?: number
+    reference_image_count?: number
+    used_composite_image?: boolean
   }
 }
 
@@ -26,11 +30,15 @@ interface EvaluateImageInput {
   image_path: string
   product_name: string
   context: string
+  rubric: EvalRubric
+  pass_threshold: number
 }
 
 interface EvaluateImageOutput {
   total_score: number
   defect_analysis: DefectAnalysis
+  passed: boolean
+  pass_threshold: number
 }
 
 export interface McpToolDefinition {
@@ -70,15 +78,23 @@ const GENERATE_IMAGE_TOOL: McpToolDefinition = {
 
 const EVALUATE_IMAGE_TOOL: McpToolDefinition = {
   name: 'evaluate_image',
-  description: '对已生成的图片进行三维度质量评估（边缘畸变/透视光影/幻觉物体），返回评分和缺陷分析',
+  description: '对已生成图片按自定义评估模板进行质量评估，返回总分、分项缺陷分析以及是否达到阈值',
   inputSchema: {
     type: 'object',
     properties: {
       image_path: { type: 'string', description: 'generate_image 返回的图片绝对路径' },
       product_name: { type: 'string', description: '商品名称' },
       context: { type: 'string', description: '拍摄场景描述' },
+      rubric: {
+        type: 'object',
+        description: '评估模板（维度、权重、分值上限、说明）',
+      },
+      pass_threshold: {
+        type: 'number',
+        description: '通过阈值（0-100）',
+      },
     },
-    required: ['image_path', 'product_name', 'context'],
+    required: ['image_path', 'product_name', 'context', 'rubric', 'pass_threshold'],
   },
 }
 
@@ -115,7 +131,11 @@ export async function createMcpServer(
             request_id: result.debugInfo.requestId,
             task_id: result.debugInfo.taskId,
             provider_mode: result.debugInfo.providerMode,
+            visual_route: result.debugInfo.visualRoute,
             fallback_reason: result.debugInfo.fallbackReason,
+            product_image_count: result.debugInfo.productImageCount,
+            reference_image_count: result.debugInfo.referenceImageCount,
+            used_composite_image: result.debugInfo.usedCompositeImage,
           }
         : undefined,
     }
@@ -128,10 +148,14 @@ export async function createMcpServer(
       imagePath: input.image_path,
       productName: input.product_name,
       context: input.context,
+      rubric: input.rubric,
+      passThreshold: Math.min(100, Math.max(0, Math.floor(input.pass_threshold))),
     })
     return {
       total_score: evalResult.totalScore,
       defect_analysis: evalResult.defectAnalysis,
+      passed: evalResult.passed,
+      pass_threshold: evalResult.passThreshold,
     }
   })
 

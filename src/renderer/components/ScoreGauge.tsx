@@ -1,17 +1,20 @@
 interface ScoreGaugeProps {
   score: number | null
   size?: number
+  passThreshold?: number
 }
 
-export function ScoreGauge({ score, size = 120 }: ScoreGaugeProps): JSX.Element {
+export function ScoreGauge({ score, size = 120, passThreshold = 85 }: ScoreGaugeProps) {
   const radius = (size - 12) / 2
   const circumference = 2 * Math.PI * radius
   const normalizedScore = score ?? 0
   const offset = circumference - (normalizedScore / 100) * circumference
 
   const getColor = (s: number): string => {
-    if (s >= 85) return '#10b981'
-    if (s >= 60) return '#f59e0b'
+    const normalizedThreshold = Math.min(100, Math.max(0, passThreshold))
+    const warningThreshold = Math.max(0, normalizedThreshold - 25)
+    if (s >= normalizedThreshold) return '#10b981'
+    if (s >= warningThreshold) return '#f59e0b'
     return '#ef4444'
   }
 

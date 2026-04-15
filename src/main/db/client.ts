@@ -12,6 +12,10 @@ import * as path from 'node:path'
 import { up as up001, down as down001 } from './migrations/001_create_tasks'
 import { up as up002, down as down002 } from './migrations/002_create_templates'
 import { up as up003, down as down003 } from './migrations/003_add_image_fields'
+import {
+  up as up004,
+  down as down004,
+} from './migrations/004_add_eval_templates_and_round_artifacts'
 
 export interface TaskTable {
   id: Generated<number>
@@ -40,6 +44,27 @@ export interface TemplateTable {
   created_at: Generated<string>
 }
 
+export interface EvaluationTemplateTable {
+  id: Generated<number>
+  name: string
+  version: number
+  default_threshold: number
+  rubric_json: string
+  created_at: Generated<string>
+}
+
+export interface TaskRoundArtifactTable {
+  id: Generated<number>
+  task_id: string
+  round_index: number
+  generated_image_path: string
+  preview_image_path: string | null
+  context_thumb_path: string | null
+  score: number | null
+  context_usage: string | null
+  created_at: Generated<string>
+}
+
 export interface ConfigTable {
   key: string
   value: string
@@ -48,6 +73,8 @@ export interface ConfigTable {
 export interface DatabaseSchema {
   tasks: TaskTable
   templates: TemplateTable
+  evaluation_templates: EvaluationTemplateTable
+  task_round_artifacts: TaskRoundArtifactTable
   config: ConfigTable
 }
 
@@ -57,6 +84,7 @@ class InlineMigrationProvider implements MigrationProvider {
       '001_create_tasks': { up: up001, down: down001 },
       '002_create_templates': { up: up002, down: down002 },
       '003_add_image_fields': { up: up003, down: down003 },
+      '004_add_eval_templates_and_round_artifacts': { up: up004, down: down004 },
     })
   }
 }

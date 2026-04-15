@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import type { ImageAsset } from '../../shared/types'
 import { toFileUrl } from '../lib/fileUrl'
 
@@ -40,9 +40,69 @@ export function ImageUploadZone({
   value,
   onChange,
   showAngleTag,
-}: ImageUploadZoneProps): JSX.Element {
+}: ImageUploadZoneProps) {
   const [isDragging, setIsDragging] = useState(false)
+  const [previewSrcByPath, setPreviewSrcByPath] = useState<Record<string, string>>({})
+  const loadingPreviewPathsRef = useRef<Set<string>>(new Set())
   const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    const activePaths = Array.from(
+      new Set(
+        value
+          .map((asset) => asset.path.trim())
+          .filter((p) => p.length > 0),
+      ),
+    )
+
+    setPreviewSrcByPath((prev) => {
+      const next: Record<string, string> = {}
+      let changed = false
+      for (const imagePath of activePaths) {
+        if (prev[imagePath]) {
+          next[imagePath] = prev[imagePath]
+        }
+      }
+
+      const prevKeys = Object.keys(prev)
+      const nextKeys = Object.keys(next)
+      if (prevKeys.length !== nextKeys.length) {
+        changed = true
+      } else if (!prevKeys.every((key) => key in next)) {
+        changed = true
+      }
+
+      return changed ? next : prev
+    })
+
+    let cancelled = false
+    for (const imagePath of activePaths) {
+      if (previewSrcByPath[imagePath]) continue
+      if (loadingPreviewPathsRef.current.has(imagePath)) continue
+      loadingPreviewPathsRef.current.add(imagePath)
+      void window.api
+        .readImageAsDataUrl(imagePath)
+        .then((result) => {
+          const dataUrl = result.dataUrl
+          if (cancelled || !dataUrl) return
+          setPreviewSrcByPath((prev) =>
+            prev[imagePath] === dataUrl
+              ? prev
+              : { ...prev, [imagePath]: dataUrl },
+          )
+        })
+        .catch(() => {
+          // Ignore and keep fallback file URL.
+        })
+        .finally(() => {
+          loadingPreviewPathsRef.current.delete(imagePath)
+        })
+    }
+
+    return () => {
+      cancelled = true
+    }
+  }, [value, previewSrcByPath])
 
   const addFiles = useCallback(
     (files: FileList | File[]) => {
@@ -119,6 +179,14 @@ export function ImageUploadZone({
     [value, onChange],
   )
 
+  const resolvePreviewSrc = useCallback(
+    (rawPath: string): string => {
+      const normalizedPath = rawPath.trim()
+      return previewSrcByPath[normalizedPath] ?? toFileUrl(normalizedPath)
+    },
+    [previewSrcByPath],
+  )
+
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-1.5">
@@ -159,9 +227,9 @@ export function ImageUploadZone({
         ) : (
           <div className="w-full grid grid-cols-4 gap-2">
             {value.map((asset, i) => (
-              <div key={asset.path} className="relative group">
+              <div key={`${asset.path}-${i}`} className="relative group">
                 <img
-                  src={toFileUrl(asset.path)}
+                  src={resolvePreviewSrc(asset.path)}
                   alt={`${label} ${i + 1}`}
                   className="w-full aspect-square object-cover rounded-md border border-gray-700"
                 />

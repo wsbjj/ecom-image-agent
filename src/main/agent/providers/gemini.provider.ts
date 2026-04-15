@@ -39,7 +39,11 @@ export class GeminiProvider implements ImageProvider {
       this.baseUrl ? { baseUrl: this.baseUrl } : undefined,
     )
 
-    const fullPrompt = `${params.prompt}${params.style ? `, style: ${params.style}` : ''}, product photography, white background, 8K, commercial quality`
+    const productCount = params.productImagePaths.length
+    const referenceCount = params.referenceImagePaths?.length ?? 0
+    const aspectRatio = params.aspectRatio ?? '1:1'
+
+    const fullPrompt = `${params.prompt}${params.style ? `, style: ${params.style}` : ''}, product photography, white background, 8K, commercial quality, target aspect ratio ${aspectRatio}`
 
     const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = []
 
@@ -65,7 +69,16 @@ export class GeminiProvider implements ImageProvider {
       }
     }
 
-    parts.push({ text: fullPrompt })
+    const roleInstruction = [
+      `Use all ${productCount} product images as the primary source for product identity, geometry, material, and key details.`,
+      referenceCount > 0
+        ? `Use all ${referenceCount} reference images only for style, color tone, composition, and lighting. Do not alter product identity.`
+        : 'No style reference images are provided.',
+      `Generate one final image with target aspect ratio ${aspectRatio}.`,
+      `Prompt: ${fullPrompt}`,
+    ].join(' ')
+
+    parts.push({ text: roleInstruction })
 
     const result: GenerateContentResult = await model.generateContent({
       contents: [{ role: 'user', parts }],
@@ -87,6 +100,13 @@ export class GeminiProvider implements ImageProvider {
     const imagePath = path.join(tmpDir, `${uuidv4()}.png`)
     await fs.writeFile(imagePath, Buffer.from(imagePart.inlineData.data, 'base64'))
 
-    return { imagePath, promptUsed: fullPrompt }
+    return {
+      imagePath,
+      promptUsed: fullPrompt,
+      debugInfo: {
+        productImageCount: productCount,
+        referenceImageCount: referenceCount,
+      },
+    }
   }
 }

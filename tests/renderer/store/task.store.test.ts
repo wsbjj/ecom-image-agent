@@ -38,6 +38,8 @@ describe('useTaskStore', () => {
         image_path: null,
         prompt_used: null,
         cost_usd: null,
+        product_images: null,
+        reference_images: null,
         created_at: '2026-04-14T10:00:00Z',
         updated_at: null,
       },
@@ -77,6 +79,7 @@ describe('useAgentStore', () => {
       phase: 'thought',
       message: '开始推理',
       retryCount: 0,
+      roundIndex: 0,
       timestamp: Date.now(),
     }
     useAgentStore.getState().handleLoopEvent(event)
@@ -95,6 +98,7 @@ describe('useAgentStore', () => {
       message: '任务成功',
       score: 92,
       retryCount: 1,
+      roundIndex: 1,
       costUsd: 0.05,
       timestamp: Date.now(),
     })
@@ -111,6 +115,7 @@ describe('useAgentStore', () => {
       phase: 'failed',
       message: '任务失败',
       retryCount: 3,
+      roundIndex: 3,
       timestamp: Date.now(),
     })
     expect(useAgentStore.getState().isRunning).toBe(false)
@@ -118,9 +123,9 @@ describe('useAgentStore', () => {
 
   it('should accumulate log lines', () => {
     const events: LoopEvent[] = [
-      { taskId: 't', phase: 'thought', message: 'msg1', retryCount: 0, timestamp: 1 },
-      { taskId: 't', phase: 'act', message: 'msg2', retryCount: 0, timestamp: 2 },
-      { taskId: 't', phase: 'observe', message: 'msg3', retryCount: 0, timestamp: 3 },
+      { taskId: 't', phase: 'thought', message: 'msg1', retryCount: 0, roundIndex: 0, timestamp: 1 },
+      { taskId: 't', phase: 'act', message: 'msg2', retryCount: 0, roundIndex: 0, timestamp: 2 },
+      { taskId: 't', phase: 'observe', message: 'msg3', retryCount: 0, roundIndex: 0, timestamp: 3 },
     ]
     events.forEach((e) => useAgentStore.getState().handleLoopEvent(e))
     expect(useAgentStore.getState().logLines).toHaveLength(3)
@@ -133,6 +138,7 @@ describe('useAgentStore', () => {
       phase: 'thought',
       message: 'test',
       retryCount: 0,
+      roundIndex: 0,
       timestamp: Date.now(),
     })
     useAgentStore.getState().reset()

@@ -1,20 +1,58 @@
-"""三维度评分 Prompt 模板，由 vlmeval_server.py 使用"""
+"""动态评分 Prompt 模板，由 vlmeval_server.py 使用"""
 
-JUDGE_SYSTEM_PROMPT = """
-你是一位专业的电商图片质量评审官，对图片进行三维度评分，总分100分。
+from __future__ import annotations
 
-## 评分维度
-1. **边缘畸变**（0-30分）：检查商品边缘是否清晰，是否有畸变、模糊或不自然变形
-2. **透视与光影**（0-30分）：检查透视角度是否合理，光影方向是否一致，阴影是否真实
-3. **幻觉物体**（0-30分）：检查是否有不存在于商品的虚假物体、虚假文字、虚假标志
-4. **整体商业质量**（0-10分）：整体是否达到电商平台主图发布标准
+from typing import Any
 
-## 输出格式（严格 JSON，不得有任何额外文字）
-{
-  "edge_distortion": {"score": <int 0-30>, "issues": [<string>]},
-  "perspective_lighting": {"score": <int 0-30>, "issues": [<string>]},
-  "hallucination": {"score": <int 0-30>, "issues": [<string>]},
-  "overall_score": <int 0-10>,
-  "overall_recommendation": "<string>"
-}
-""".strip()
+
+def build_judge_system_prompt(rubric: dict[str, Any]) -> str:
+    dimensions = rubric.get("dimensions", [])
+    if not isinstance(dimensions, list) or len(dimensions) == 0:
+        raise ValueError("rubric.dimensions 不能为空")
+
+    dimension_lines: list[str] = []
+    schema_lines: list[str] = []
+
+    for idx, item in enumerate(dimensions, start=1):
+        key = str(item.get("key", "")).strip()
+        name = str(item.get("name", key or f"dim_{idx}")).strip()
+        max_score = int(item.get("maxScore", 10))
+        weight = float(item.get("weight", 0))
+        description = str(item.get("description", "")).strip()
+        if not key:
+            raise ValueError("rubric dimension key 不能为空")
+
+        dimension_lines.append(
+            f"{idx}. **{name}**（key={key}, 0-{max_score}分, 权重={weight:.3f}）：{description}"
+        )
+
+        schema_lines.append(
+            "{"
+            f'"key": "{key}", '
+            f'"name": "{name}", '
+            '"score": <int>, '
+            f'"maxScore": {max_score}, '
+            f'"weight": {weight:.3f}, '
+            '"issues": [<string>], '
+            '"reason": "<string>"'
+            "}"
+        )
+
+    notes = str(rubric.get("scoringNotes", "")).strip()
+    notes_block = f"\n补充规则：{notes}\n" if notes else "\n"
+
+    return (
+        "你是一位专业的电商图片质量评审官。"
+        "请严格按 rubric 逐项打分并返回 JSON。"
+        "\n\n## 评分维度\n"
+        + "\n".join(dimension_lines)
+        + notes_block
+        + "\n## 输出格式（严格 JSON，不得有任何额外文字）\n"
+        + "{\n"
+        + '  "dimensions": ['
+        + ", ".join(schema_lines)
+        + "],\n"
+        + '  "overall_recommendation": "<string>",\n'
+        + '  "summary": "<string>"\n'
+        + "}\n"
+    ).strip()

@@ -2,6 +2,7 @@ export const IPC_CHANNELS = {
   TASK_START: 'task:start',
   TASK_STOP: 'task:stop',
   TASK_LIST: 'task:list',
+  TASK_ROUND_ARTIFACTS: 'task:round-artifacts',
   AGENT_LOOP_EVENT: 'agent:loop-event',
   CONFIG_GET: 'config:get',
   CONFIG_GET_VALUE: 'config:get-value',
@@ -13,6 +14,10 @@ export const IPC_CHANNELS = {
   TEMPLATE_SAVE: 'template:save',
   TEMPLATE_LIST: 'template:list',
   TEMPLATE_DELETE: 'template:delete',
+  EVAL_TEMPLATE_SAVE: 'eval-template:save',
+  EVAL_TEMPLATE_LIST: 'eval-template:list',
+  EVAL_TEMPLATE_DELETE: 'eval-template:delete',
+  EVAL_TEMPLATE_GENERATE_STANDARD: 'eval-template:generate-standard',
 } as const satisfies Record<string, string>
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS]

@@ -13,7 +13,7 @@ const NAV_ITEMS = [
   { to: '/settings', label: '设置', icon: '⚙️' },
 ] as const
 
-function Sidebar(): JSX.Element {
+function Sidebar() {
   return (
     <nav className="w-56 bg-gray-900/80 border-r border-gray-700/50 flex flex-col">
       <div className="p-4 border-b border-gray-700/50">
@@ -50,7 +50,7 @@ function Sidebar(): JSX.Element {
   )
 }
 
-export function App(): JSX.Element {
+export function App() {
   return (
     <HashRouter>
       <div className="flex h-screen bg-gray-950 text-gray-100">

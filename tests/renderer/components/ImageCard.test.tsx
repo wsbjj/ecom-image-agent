@@ -11,15 +11,30 @@ const baseTask: TaskRecord = {
   retry_count: 2,
   total_score: 88,
   defect_analysis: JSON.stringify({
-    edge_distortion: { score: 28, issues: ['轻微模糊'] },
-    perspective_lighting: { score: 30, issues: [] },
-    hallucination: { score: 30, issues: [] },
+    dimensions: [
+      {
+        key: 'edge_distortion',
+        name: '边缘畸变',
+        score: 28,
+        maxScore: 30,
+        issues: ['轻微模糊'],
+      },
+      {
+        key: 'perspective_lighting',
+        name: '透视与光影',
+        score: 30,
+        maxScore: 30,
+        issues: [],
+      },
+    ],
     overall_recommendation: '基本合格',
   }),
   status: 'success',
   image_path: null,
   prompt_used: null,
   cost_usd: 0.0532,
+  product_images: null,
+  reference_images: null,
   created_at: '2026-04-14T10:00:00.000Z',
   updated_at: '2026-04-14T10:05:00.000Z',
 }
@@ -71,7 +86,7 @@ describe('ImageCard', () => {
 
   it('should parse and display first defect issue', () => {
     render(<ImageCard task={baseTask} />)
-    expect(screen.getByText('边缘: 轻微模糊')).toBeInTheDocument()
+    expect(screen.getByText('边缘畸变: 轻微模糊')).toBeInTheDocument()
   })
 
   it('should convert windows image path to safe file URL', () => {

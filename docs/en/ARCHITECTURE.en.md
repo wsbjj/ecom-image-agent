@@ -53,8 +53,8 @@ Flow summary:
 
 Key constants:
 
-- `MAX_RETRIES = 3`
-- `SCORE_THRESHOLD = 85`
+- `MAX_RETRIES` defaults to `3` (override via Settings key `AGENT_MAX_RETRIES`, range `0~10`)
+- `SCORE_THRESHOLD` defaults to `85` (override via Settings key `AGENT_SCORE_THRESHOLD`, range `0~100`)
 - Input token cost: `3 / 1_000_000`
 - Output token cost: `15 / 1_000_000`
 
