@@ -26,6 +26,17 @@ interface VisualApiResponse<TData> {
   data: TData | null
 }
 
+interface VisualMetadataErrorShape {
+  CodeN?: number
+  Code?: string
+  Message?: string
+}
+
+interface VisualMetadataShape {
+  RequestId?: string
+  Error?: VisualMetadataErrorShape
+}
+
 interface SubmitTaskData {
   task_id: string
 }
@@ -64,6 +75,65 @@ function formatAmzDate(now: Date): { shortDate: string; longDate: string } {
 
 function isRetriableCode(code: number): boolean {
   return code === 50429 || code === 50430
+}
+
+function isAuthLikeError(message: string): boolean {
+  return /SignatureDoesNotMatch|InvalidAccessKeyId|AccessDenied|Unauthorized|AuthFailure|code=100010/i.test(
+    message,
+  )
+}
+
+function parseVisualResponsePayload<TData>(
+  httpStatus: number,
+  payloadText: string,
+): VisualApiResponse<TData> {
+  let payload: unknown
+  try {
+    payload = JSON.parse(payloadText)
+  } catch {
+    return {
+      code: httpStatus,
+      message: `Visual API 返回非 JSON 响应: ${payloadText.slice(0, 200)}`,
+      data: null,
+    }
+  }
+
+  if (typeof payload !== 'object' || payload === null) {
+    return {
+      code: httpStatus,
+      message: `Visual API 返回了无效响应结构: ${String(payload).slice(0, 200)}`,
+      data: null,
+    }
+  }
+
+  const direct = payload as Partial<VisualApiResponse<TData>>
+  if (typeof direct.code === 'number') {
+    return {
+      code: direct.code,
+      message: typeof direct.message === 'string' ? direct.message : '',
+      request_id: typeof direct.request_id === 'string' ? direct.request_id : undefined,
+      data: (direct.data as TData | null | undefined) ?? null,
+    }
+  }
+
+  const metadata = (payload as { ResponseMetadata?: VisualMetadataShape }).ResponseMetadata
+  if (metadata?.Error) {
+    const errorCodeN = metadata.Error.CodeN
+    const errorCode = metadata.Error.Code
+    const errorMessage = metadata.Error.Message ?? 'Unknown Visual API error'
+    return {
+      code: typeof errorCodeN === 'number' ? errorCodeN : httpStatus,
+      message: errorCode ? `${errorCode}: ${errorMessage}` : errorMessage,
+      request_id: metadata.RequestId,
+      data: null,
+    }
+  }
+
+  return {
+    code: httpStatus,
+    message: `Visual API 返回未知结构: ${payloadText.slice(0, 200)}`,
+    data: null,
+  }
 }
 
 export class SeedreamVisualProvider implements ImageProvider {
@@ -142,6 +212,9 @@ export class SeedreamVisualProvider implements ImageProvider {
       }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
+      if (isAuthLikeError(message)) {
+        throw new Error(`官方 Visual 鉴权失败，请检查 AK/SK 或权限配置：${message}`)
+      }
       return this.callFallback(params, `官方 Visual 调用失败：${message}`)
     }
   }
@@ -153,13 +226,19 @@ export class SeedreamVisualProvider implements ImageProvider {
     if (!this.fallbackProvider) {
       throw new Error(reason)
     }
-    const fallbackResult = await this.fallbackProvider.generate(params)
-    return {
-      ...fallbackResult,
-      debugInfo: {
-        ...fallbackResult.debugInfo,
-        fallbackReason: reason,
-      },
+    try {
+      const fallbackResult = await this.fallbackProvider.generate(params)
+      return {
+        ...fallbackResult,
+        debugInfo: {
+          ...fallbackResult.debugInfo,
+          fallbackReason: reason,
+        },
+      }
+    } catch (fallbackError: unknown) {
+      const fallbackMessage =
+        fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      throw new Error(`${reason}；回退 openai_compat 也失败：${fallbackMessage}`)
     }
   }
 
@@ -220,7 +299,7 @@ export class SeedreamVisualProvider implements ImageProvider {
         return response
       }
 
-      if (isRetriableCode(response.code) && attempt < maxAttempts) {
+      if (Number.isFinite(response.code) && isRetriableCode(response.code) && attempt < maxAttempts) {
         await sleep(500 * attempt)
         continue
       }
@@ -273,7 +352,8 @@ export class SeedreamVisualProvider implements ImageProvider {
       sha256Hex(canonicalRequest),
     ].join('\n')
 
-    const kDate = hmacBuffer(`VOLC${this.secretAccessKey}`, shortDate)
+    // Volcengine Signature V4 uses raw secret key for the date key derivation.
+    const kDate = hmacBuffer(this.secretAccessKey, shortDate)
     const kRegion = hmacBuffer(kDate, VISUAL_REGION)
     const kService = hmacBuffer(kRegion, VISUAL_SERVICE)
     const kSigning = hmacBuffer(kService, 'request')
@@ -293,7 +373,8 @@ export class SeedreamVisualProvider implements ImageProvider {
       body: bodyText,
     })
 
-    const payload = (await resp.json()) as VisualApiResponse<TData>
+    const payloadText = await resp.text()
+    const payload = parseVisualResponsePayload<TData>(resp.status, payloadText)
     if (resp.status === 429 && payload.code === 10000) {
       return { ...payload, code: 50430, message: 'Request Has Reached API Limit' }
     }

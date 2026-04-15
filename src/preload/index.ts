@@ -61,6 +61,9 @@ const api = {
   getUserDataPath: (): Promise<{ path: string }> =>
     ipcRenderer.invoke(IPC_CHANNELS.APP_USER_DATA_PATH),
 
+  readImageAsDataUrl: (filePath: string): Promise<{ dataUrl: string | null }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.FILE_READ_AS_DATA_URL, filePath),
+
   saveTemplate: (template: TemplateInput): Promise<{ success: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.TEMPLATE_SAVE, template),
 

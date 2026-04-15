@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import type { DefectAnalysis, TaskRecord } from '../../shared/types'
 import { toFileUrl } from '../lib/fileUrl'
 
@@ -42,7 +43,36 @@ function getStatusLabel(status: TaskRecord['status']): string {
 
 export function ImageCard({ task }: ImageCardProps): JSX.Element {
   const defects = parseDefects(task.defect_analysis)
-  const imageSrc = task.image_path ? toFileUrl(task.image_path) : null
+  const [imageSrc, setImageSrc] = useState<string | null>(
+    task.image_path ? toFileUrl(task.image_path) : null,
+  )
+
+  useEffect(() => {
+    let mounted = true
+
+    if (!task.image_path) {
+      setImageSrc(null)
+      return () => {
+        mounted = false
+      }
+    }
+
+    const fallbackUrl = toFileUrl(task.image_path)
+    void window.api
+      .readImageAsDataUrl(task.image_path)
+      .then((result) => {
+        if (!mounted) return
+        setImageSrc(result.dataUrl ?? fallbackUrl)
+      })
+      .catch(() => {
+        if (!mounted) return
+        setImageSrc(fallbackUrl)
+      })
+
+    return () => {
+      mounted = false
+    }
+  }, [task.image_path])
 
   return (
     <div className="rounded-xl border border-gray-700/50 bg-gray-800/50 overflow-hidden hover:border-gray-600/50 transition-colors">

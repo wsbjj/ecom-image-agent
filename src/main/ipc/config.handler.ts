@@ -1,6 +1,8 @@
 import { app, ipcMain, safeStorage } from 'electron'
 import Anthropic from '@anthropic-ai/sdk'
 import { GoogleGenerativeAI } from '@google/generative-ai'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import { IPC_CHANNELS } from '../../shared/ipc-channels'
 import { SeedreamProvider } from '../agent/providers/seedream.provider'
 import { SeedreamVisualProvider } from '../agent/providers/seedream-visual.provider'
@@ -18,6 +20,27 @@ async function getOptionalDecryptedValue(key: string): Promise<string | undefine
   if (!val) return undefined
   const text = safeStorage.decryptString(Buffer.from(val, 'base64')).trim()
   return text.length > 0 ? text : undefined
+}
+
+function guessMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase()
+  switch (ext) {
+    case '.png':
+      return 'image/png'
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg'
+    case '.webp':
+      return 'image/webp'
+    case '.gif':
+      return 'image/gif'
+    case '.bmp':
+      return 'image/bmp'
+    case '.svg':
+      return 'image/svg+xml'
+    default:
+      return 'application/octet-stream'
+  }
 }
 
 export function registerConfigHandlers(): void {
@@ -173,21 +196,43 @@ export function registerConfigHandlers(): void {
           return { success: false, message: '请先输入 Seedream API Key' }
         }
 
-        const fallbackProvider = new SeedreamProvider({
+        if (callMode === 'visual_official') {
+          if (!accessKeyId || !secretAccessKey) {
+            return { success: false, message: '官方 Visual 模式需要填写 AccessKey/SecretKey' }
+          }
+
+          // 测试连接必须严格命中用户选择的协议；Visual 模式下禁止自动回退 openai_compat。
+          const provider = new SeedreamVisualProvider({
+            accessKeyId,
+            secretAccessKey,
+            reqKey,
+          })
+          const generated = await provider.generate({
+            prompt: 'A plain white background image for API connectivity test.',
+            productImagePaths: [],
+            aspectRatio: '1:1',
+          })
+          const mode = generated.debugInfo?.providerMode ?? 'visual_official'
+          if (mode !== 'visual_official') {
+            return {
+              success: false,
+              message: `Seedream Visual 测试失败：当前实际走的是 ${mode}，请检查调用模式配置`,
+              durationMs: Date.now() - startedAt,
+            }
+          }
+
+          return {
+            success: true,
+            message: `Seedream 图像测试成功（模型: ${endpointId}，模式: visual_official）`,
+            durationMs: Date.now() - startedAt,
+          }
+        }
+
+        const provider = new SeedreamProvider({
           apiKey,
           baseUrl,
           endpointId,
         })
-        const provider =
-          callMode === 'visual_official'
-            ? new SeedreamVisualProvider({
-                accessKeyId,
-                secretAccessKey,
-                reqKey,
-                fallbackProvider,
-              })
-            : fallbackProvider
-
         const generated = await provider.generate({
           prompt: 'A plain white background image for API connectivity test.',
           productImagePaths: [],
@@ -210,6 +255,22 @@ export function registerConfigHandlers(): void {
     IPC_CHANNELS.APP_USER_DATA_PATH,
     async (): Promise<{ path: string }> => {
       return { path: app.getPath('userData') }
+    },
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.FILE_READ_AS_DATA_URL,
+    async (_event, filePath: string): Promise<{ dataUrl: string | null }> => {
+      try {
+        const normalizedPath = filePath.trim()
+        if (!normalizedPath) return { dataUrl: null }
+
+        const buffer = await fs.readFile(normalizedPath)
+        const mimeType = guessMimeType(normalizedPath)
+        return { dataUrl: `data:${mimeType};base64,${buffer.toString('base64')}` }
+      } catch {
+        return { dataUrl: null }
+      }
     },
   )
 

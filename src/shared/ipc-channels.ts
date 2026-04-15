@@ -9,6 +9,7 @@ export const IPC_CHANNELS = {
   CONFIG_TEST_ANTHROPIC: 'config:test-anthropic',
   CONFIG_TEST_IMAGE_PROVIDER: 'config:test-image-provider',
   APP_USER_DATA_PATH: 'app:user-data-path',
+  FILE_READ_AS_DATA_URL: 'file:read-as-data-url',
   TEMPLATE_SAVE: 'template:save',
   TEMPLATE_LIST: 'template:list',
   TEMPLATE_DELETE: 'template:delete',

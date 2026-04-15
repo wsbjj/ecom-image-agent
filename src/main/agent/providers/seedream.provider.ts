@@ -7,6 +7,11 @@ import type { ImageProvider, GenerateImageParams, GenerateImageResult } from './
 
 const DEFAULT_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
 const DEFAULT_MODEL = 'doubao-seedream-3-0-t2i-250415'
+const COMPATIBLE_MODEL_FALLBACKS = [
+  'doubao-seedream-4-5-251128',
+  'doubao-seedream-4-0-250828',
+  'doubao-seedream-3-0-t2i-250415',
+]
 
 const ASPECT_TO_SIZE: Record<string, string> = {
   // Seedream requires at least 3,686,400 pixels.
@@ -44,11 +49,20 @@ export class SeedreamProvider implements ImageProvider {
     const fullPrompt = `${params.prompt}${params.style ? `, style: ${params.style}` : ''}, e-commerce product photography, high quality, commercial grade`
 
     let imageUrl: string
+    let usedModel: string
 
     if (hasProductImages) {
-      imageUrl = await this.generateWithReference(fullPrompt, params.productImagePaths[0], size)
+      const generated = await this.generateWithReference(
+        fullPrompt,
+        params.productImagePaths[0],
+        size,
+      )
+      imageUrl = generated.imageUrl
+      usedModel = generated.model
     } else {
-      imageUrl = await this.generateTextToImage(fullPrompt, size)
+      const generated = await this.generateTextToImage(fullPrompt, size)
+      imageUrl = generated.imageUrl
+      usedModel = generated.model
     }
 
     const tmpDir = path.join(app.getPath('userData'), 'tmp_images')
@@ -69,47 +83,84 @@ export class SeedreamProvider implements ImageProvider {
       promptUsed: fullPrompt,
       debugInfo: {
         providerMode: 'openai_compat',
+        ...(usedModel !== this.modelId
+          ? {
+              fallbackReason: `模型 ${this.modelId} 不支持当前 API，已自动回退到 ${usedModel}`,
+            }
+          : {}),
       },
     }
   }
 
-  private async generateTextToImage(prompt: string, size: string): Promise<string> {
-    let response: Awaited<ReturnType<typeof this.client.images.generate>>
-    try {
-      response = await this.client.images.generate({
-        model: this.modelId,
-        prompt,
-        size: size as '1024x1024',
-        n: 1,
-        response_format: 'url',
-      })
-    } catch (error: unknown) {
-      if (isUnsupportedImagesApiError(error)) {
-        return await this.generateViaChatPrompt(prompt, size)
-      }
-      throw error
+  private buildModelCandidates(preferred?: string): string[] {
+    const seen = new Set<string>()
+    const ordered = [preferred ?? this.modelId, ...COMPATIBLE_MODEL_FALLBACKS]
+    const candidates: string[] = []
+    for (const model of ordered) {
+      if (!model || seen.has(model)) continue
+      seen.add(model)
+      candidates.push(model)
     }
-
-    const data = response.data
-    if (!data || data.length === 0) {
-      throw new Error('Seedream 未返回图片数据')
-    }
-
-    const first = data[0]
-    const url = first.url ?? first.b64_json
-    if (!url) {
-      throw new Error('Seedream 未返回图片数据')
-    }
-
-    if (first.b64_json) {
-      return `data:image/png;base64,${first.b64_json}`
-    }
-    return url
+    return candidates
   }
 
-  private async generateViaChatPrompt(prompt: string, size: string): Promise<string> {
+  private async generateTextToImage(
+    prompt: string,
+    size: string,
+    preferredModel?: string,
+  ): Promise<{ imageUrl: string; model: string }> {
+    let lastError: unknown
+    const modelCandidates = this.buildModelCandidates(preferredModel)
+
+    for (const model of modelCandidates) {
+      let response: Awaited<ReturnType<typeof this.client.images.generate>>
+      try {
+        response = await this.client.images.generate({
+          model,
+          prompt,
+          size: size as '1024x1024',
+          n: 1,
+          response_format: 'url',
+        })
+      } catch (error: unknown) {
+        if (isUnsupportedImagesApiError(error)) {
+          try {
+            const fallbackUrl = await this.generateViaChatPrompt(prompt, size, model)
+            return { imageUrl: fallbackUrl, model }
+          } catch (chatError: unknown) {
+            if (isUnsupportedImagesApiError(chatError)) {
+              lastError = chatError
+              continue
+            }
+            throw chatError
+          }
+        }
+        throw error
+      }
+
+      const data = response.data
+      if (!data || data.length === 0) {
+        throw new Error('Seedream 未返回图片数据')
+      }
+
+      const first = data[0]
+      const url = first.url ?? first.b64_json
+      if (!url) {
+        throw new Error('Seedream 未返回图片数据')
+      }
+
+      if (first.b64_json) {
+        return { imageUrl: `data:image/png;base64,${first.b64_json}`, model }
+      }
+      return { imageUrl: url, model }
+    }
+
+    throw (lastError ?? new Error('Seedream 模型均不支持当前 API，请更换 endpointId 或调用模式'))
+  }
+
+  private async generateViaChatPrompt(prompt: string, size: string, model: string): Promise<string> {
     const response = await this.client.chat.completions.create({
-      model: this.modelId,
+      model,
       messages: [
         {
           role: 'user',
@@ -133,7 +184,7 @@ export class SeedreamProvider implements ImageProvider {
     prompt: string,
     refImagePath: string,
     size: string,
-  ): Promise<string> {
+  ): Promise<{ imageUrl: string; model: string }> {
     const imageData = await fs.readFile(refImagePath)
     const base64 = imageData.toString('base64')
     const ext = path.extname(refImagePath).toLowerCase()
@@ -146,44 +197,55 @@ export class SeedreamProvider implements ImageProvider {
     const mime = mimeMap[ext] ?? 'image/png'
     const dataUri = `data:${mime};base64,${base64}`
 
-    try {
-      const response = await this.client.chat.completions.create({
-        model: this.modelId,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: { url: dataUri },
-              },
-              {
-                type: 'text',
-                text: `Based on this product image, generate a professional e-commerce product photo: ${prompt}. Output image size: ${size}`,
-              },
-            ],
-          },
-        ],
-      })
+    const modelCandidates = this.buildModelCandidates()
+    let lastError: unknown
 
-      const content = response.choices[0]?.message?.content
-      if (!content) {
-        throw new Error('Seedream 图生图未返回结果')
+    for (const model of modelCandidates) {
+      try {
+        const response = await this.client.chat.completions.create({
+          model,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image_url',
+                  image_url: { url: dataUri },
+                },
+                {
+                  type: 'text',
+                  text: `Based on this product image, generate a professional e-commerce product photo: ${prompt}. Output image size: ${size}`,
+                },
+              ],
+            },
+          ],
+        })
+
+        const content = response.choices[0]?.message?.content
+        if (!content) {
+          throw new Error('Seedream 图生图未返回结果')
+        }
+
+        const urlMatch = content.match(/https?:\/\/[^\s"]+/)
+        if (urlMatch) return { imageUrl: urlMatch[0], model }
+
+        return await this.generateTextToImage(prompt, size, model)
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error)
+        const unsupportedImageInput = /does not support image input|cannot read\s+"?.+\.(png|jpg|jpeg|webp|gif)"?/i.test(
+          message,
+        )
+        if (unsupportedImageInput) {
+          return await this.generateTextToImage(prompt, size, model)
+        }
+        if (isUnsupportedImagesApiError(error)) {
+          lastError = error
+          continue
+        }
+        throw error
       }
-
-      const urlMatch = content.match(/https?:\/\/[^\s"]+/)
-      if (urlMatch) return urlMatch[0]
-
-      return await this.generateTextToImage(prompt, size)
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error)
-      const unsupportedImageInput = /does not support image input|cannot read\s+"?.+\.(png|jpg|jpeg|webp|gif)"?/i.test(
-        message,
-      )
-      if (unsupportedImageInput) {
-        return await this.generateTextToImage(prompt, size)
-      }
-      throw error
     }
+
+    throw (lastError ?? new Error('Seedream 图生图失败：未找到可用模型'))
   }
 }

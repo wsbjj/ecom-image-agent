@@ -12,6 +12,7 @@ const mockApi = {
   testAnthropicConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok' }),
   testImageProviderConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok', durationMs: 100 }),
   getUserDataPath: vi.fn().mockResolvedValue({ path: 'C:/Users/test/AppData/Roaming/ecom-image-agent' }),
+  readImageAsDataUrl: vi.fn().mockResolvedValue({ dataUrl: null }),
   resolveLocalPath: vi.fn().mockReturnValue(''),
   saveTemplate: vi.fn().mockResolvedValue({ success: true }),
   listTemplates: vi.fn().mockResolvedValue([]),
