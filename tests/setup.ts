@@ -8,15 +8,15 @@ const mockApi = {
   onAgentEvent: vi.fn().mockReturnValue(() => {}),
   saveConfig: vi.fn().mockResolvedValue({ success: true }),
   checkConfig: vi.fn().mockResolvedValue({ exists: false }),
+  getConfigValue: vi.fn().mockResolvedValue({ value: null }),
+  testAnthropicConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok' }),
+  getUserDataPath: vi.fn().mockResolvedValue({ path: 'C:/Users/test/AppData/Roaming/ecom-image-agent' }),
   saveTemplate: vi.fn().mockResolvedValue({ success: true }),
   listTemplates: vi.fn().mockResolvedValue([]),
   deleteTemplate: vi.fn().mockResolvedValue({ success: true }),
 }
 
-Object.defineProperty(globalThis, 'window', {
-  value: {
-    ...globalThis.window,
-    api: mockApi,
-  },
+Object.defineProperty(window, 'api', {
+  value: mockApi,
   writable: true,
 })

@@ -31,6 +31,13 @@ const api = {
   getConfigValue: (key: string): Promise<{ value: string | null }> =>
     ipcRenderer.invoke(IPC_CHANNELS.CONFIG_GET_VALUE, key),
 
+  testAnthropicConnection: (params: {
+    apiKey?: string
+    baseUrl?: string
+    model?: string
+  }): Promise<{ success: boolean; message: string }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.CONFIG_TEST_ANTHROPIC, params),
+
   getUserDataPath: (): Promise<{ path: string }> =>
     ipcRenderer.invoke(IPC_CHANNELS.APP_USER_DATA_PATH),
 

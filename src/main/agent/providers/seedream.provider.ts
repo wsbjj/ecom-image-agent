@@ -5,7 +5,7 @@ import * as path from 'node:path'
 import { v4 as uuidv4 } from 'uuid'
 import type { ImageProvider, GenerateImageParams, GenerateImageResult } from './base'
 
-const ARK_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
+const DEFAULT_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
 const DEFAULT_MODEL = 'doubao-seedream-3-0-t2i-250415'
 
 const ASPECT_TO_SIZE: Record<string, string> = {
@@ -21,11 +21,12 @@ export class SeedreamProvider implements ImageProvider {
 
   constructor(options: {
     apiKey: string
+    baseUrl?: string
     endpointId?: string
   }) {
     this.client = new OpenAI({
       apiKey: options.apiKey,
-      baseURL: ARK_BASE_URL,
+      baseURL: options.baseUrl ?? DEFAULT_BASE_URL,
     })
     this.modelId = options.endpointId ?? DEFAULT_MODEL
   }

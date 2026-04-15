@@ -34,8 +34,9 @@ async function createImageProvider(): Promise<ImageProvider> {
   switch (providerName) {
     case 'seedream': {
       const apiKey = await getDecryptedKey('APIKEY_SEEDREAM')
+      const baseUrl = await getOptionalDecryptedValue('SEEDREAM_BASE_URL')
       const endpointId = await getOptionalDecryptedValue('SEEDREAM_ENDPOINT_ID')
-      return new SeedreamProvider({ apiKey, endpointId })
+      return new SeedreamProvider({ apiKey, baseUrl, endpointId })
     }
     case 'gemini':
     default: {

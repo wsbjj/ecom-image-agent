@@ -6,6 +6,7 @@ export const IPC_CHANNELS = {
   CONFIG_GET: 'config:get',
   CONFIG_GET_VALUE: 'config:get-value',
   CONFIG_SET: 'config:set',
+  CONFIG_TEST_ANTHROPIC: 'config:test-anthropic',
   APP_USER_DATA_PATH: 'app:user-data-path',
   TEMPLATE_SAVE: 'template:save',
   TEMPLATE_LIST: 'template:list',
