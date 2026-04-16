@@ -9,6 +9,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -90,11 +91,82 @@ def load_env_file(env_path: Path) -> None:
 
 
 def _extract_json_block(raw_text: str) -> dict[str, Any]:
-    start = raw_text.find("{")
-    end = raw_text.rfind("}") + 1
-    if start == -1 or end == 0:
-        raise ValueError(f"模型未返回有效 JSON: {raw_text[:200]}")
-    return json.loads(raw_text[start:end])
+    candidate_texts: list[str] = []
+    trimmed = raw_text.strip()
+    if trimmed:
+        candidate_texts.append(trimmed)
+
+    for match in re.finditer(r"```json\s*([\s\S]*?)```", raw_text, flags=re.IGNORECASE):
+        payload = match.group(1).strip()
+        if payload:
+            candidate_texts.append(payload)
+
+    for match in re.finditer(r"```\s*([\s\S]*?)```", raw_text):
+        payload = match.group(1).strip()
+        if payload:
+            candidate_texts.append(payload)
+
+    object_candidates: list[str] = []
+    for start in [idx for idx, ch in enumerate(raw_text) if ch == "{"]:
+        depth = 0
+        for end in range(start, len(raw_text)):
+            ch = raw_text[end]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    snippet = raw_text[start : end + 1].strip()
+                    if snippet:
+                        object_candidates.append(snippet)
+                    break
+            if depth < 0:
+                break
+
+    candidate_texts.extend(object_candidates)
+
+    seen: set[str] = set()
+    for candidate in candidate_texts:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+
+    raise ValueError(f"模型未返回有效 JSON: {raw_text[:200]}")
+
+
+def _get_block_field(block: Any, key: str) -> Any:
+    value = getattr(block, key, None)
+    if value is None and isinstance(block, dict):
+        value = block.get(key)
+    return value
+
+
+def _collect_text_fragments(value: Any) -> list[str]:
+    if isinstance(value, str):
+        trimmed = value.strip()
+        return [trimmed] if trimmed else []
+
+    if isinstance(value, list):
+        fragments: list[str] = []
+        for item in value:
+            fragments.extend(_collect_text_fragments(item))
+        return fragments
+
+    if isinstance(value, dict):
+        fragments: list[str] = []
+        for key in ("text", "content", "value", "thinking", "reasoning", "output_text"):
+            nested = value.get(key)
+            if nested is not None:
+                fragments.extend(_collect_text_fragments(nested))
+        return fragments
+
+    return []
 
 
 def _extract_text_from_message_content(message: Any) -> str:
@@ -103,6 +175,7 @@ def _extract_text_from_message_content(message: Any) -> str:
         raise ValueError("model content is invalid")
 
     text_parts: list[str] = []
+    fallback_parts: list[str] = []
     block_types: list[str] = []
     for block in content:
         block_type = getattr(block, "type", None)
@@ -110,18 +183,16 @@ def _extract_text_from_message_content(message: Any) -> str:
             block_type = block.get("type")
         block_types.append(str(block_type) if block_type else type(block).__name__)
 
-        text_value = getattr(block, "text", None)
-        if text_value is None and isinstance(block, dict):
-            text_value = block.get("text")
-        if isinstance(text_value, str):
-            trimmed = text_value.strip()
-            if trimmed:
-                text_parts.append(trimmed)
+        text_parts.extend(_collect_text_fragments(_get_block_field(block, "text")))
+        for key in ("thinking", "reasoning", "output_text", "content"):
+            fallback_parts.extend(_collect_text_fragments(_get_block_field(block, key)))
 
-    if not text_parts:
-        raise ValueError("model returned no text block, block_types=" + ",".join(block_types))
+    if text_parts:
+        return "\n".join(text_parts)
+    if fallback_parts:
+        return "\n".join(fallback_parts)
 
-    return "\n".join(text_parts)
+    raise ValueError("model returned no usable text block, block_types=" + ",".join(block_types))
 
 
 def _normalize_dimensions(
