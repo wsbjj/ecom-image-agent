@@ -152,5 +152,5 @@ export interface EvaluationTemplateInput {
   name: string
   version: number
   defaultThreshold: number
-  rubric: EvalRubric
+  rubricMarkdown: string
 }

@@ -1,5 +1,9 @@
 import { useEffect, useState, useCallback } from 'react'
 import { MonacoPane } from '../components/MonacoPane'
+import {
+  parseEvalRubricMarkdown,
+  formatEvalRubricMarkdown,
+} from '../../shared/eval-rubric-markdown'
 import type {
   TemplateRecord,
   TemplateInput,
@@ -60,7 +64,18 @@ const DEFAULT_EVAL_FORM = {
   name: '',
   version: '1',
   defaultThreshold: '85',
-  rubric: JSON.stringify(DEFAULT_EVAL_RUBRIC, null, 2),
+  rubricMarkdown: formatEvalRubricMarkdown(DEFAULT_EVAL_RUBRIC),
+}
+
+function formatStoredRubricAsMarkdown(rubricJson: string): string {
+  try {
+    const rubric = JSON.parse(rubricJson) as EvalRubric
+    return formatEvalRubricMarkdown(rubric)
+  } catch {
+    return ['## 评分维度', '', '> 解析 rubric_json 失败，以下是原始内容：', '', '```json', rubricJson, '```'].join(
+      '\n',
+    )
+  }
 }
 
 export function Templates() {
@@ -114,15 +129,10 @@ export function Templates() {
       return
     }
 
-    let rubric: EvalRubric
     try {
-      rubric = JSON.parse(evalForm.rubric) as EvalRubric
-      if (!Array.isArray(rubric.dimensions) || rubric.dimensions.length === 0) {
-        setErrorMessage('rubric.dimensions 不能为空')
-        return
-      }
-    } catch {
-      setErrorMessage('Rubric JSON 格式不合法')
+      parseEvalRubricMarkdown(evalForm.rubricMarkdown)
+    } catch (error: unknown) {
+      setErrorMessage(error instanceof Error ? error.message : 'Rubric Markdown 格式不合法')
       return
     }
 
@@ -137,12 +147,17 @@ export function Templates() {
       return
     }
 
-    await window.api.saveEvaluationTemplate({
-      name: evalForm.name.trim(),
-      version,
-      defaultThreshold,
-      rubric,
-    })
+    try {
+      await window.api.saveEvaluationTemplate({
+        name: evalForm.name.trim(),
+        version,
+        defaultThreshold,
+        rubricMarkdown: evalForm.rubricMarkdown,
+      })
+    } catch (error: unknown) {
+      setErrorMessage(error instanceof Error ? error.message : '保存评估模板失败')
+      return
+    }
 
     setIsCreatingEval(false)
     setEvalForm(DEFAULT_EVAL_FORM)
@@ -355,7 +370,11 @@ export function Templates() {
               </div>
             </div>
             <div className="flex-1 p-4">
-              <MonacoPane value={evalForm.rubric} onChange={(v) => setEvalForm({ ...evalForm, rubric: v })} />
+              <MonacoPane
+                value={evalForm.rubricMarkdown}
+                onChange={(v) => setEvalForm({ ...evalForm, rubricMarkdown: v })}
+                language="markdown"
+              />
             </div>
           </div>
         ) : selectedEval ? (
@@ -375,7 +394,12 @@ export function Templates() {
               </button>
             </div>
             <div className="flex-1 p-4">
-              <MonacoPane value={selectedEval.rubric_json} onChange={() => {}} readOnly />
+              <MonacoPane
+                value={formatStoredRubricAsMarkdown(selectedEval.rubric_json)}
+                onChange={() => {}}
+                language="markdown"
+                readOnly
+              />
             </div>
           </div>
         ) : (

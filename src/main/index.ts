@@ -4,8 +4,10 @@ import { runMigrations } from './db/client'
 import { registerAgentHandlers, cleanupAgentHandlers } from './ipc/agent.handler'
 import { registerTaskHandlers } from './ipc/task.handler'
 import { registerConfigHandlers } from './ipc/config.handler'
+import { setupNativeShellUI } from './ui/native-shell'
 
 let mainWindow: BrowserWindow | null = null
+const WINDOW_TITLE = 'Ecom Image Agent'
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -20,6 +22,7 @@ function createWindow(): void {
       sandbox: false,
     },
     titleBarStyle: 'hiddenInset',
+    title: WINDOW_TITLE,
     show: false,
   })
 
@@ -49,6 +52,7 @@ app
   .whenReady()
   .then(async () => {
     await runMigrations()
+    setupNativeShellUI({ appName: WINDOW_TITLE })
     createWindow()
 
     app.on('activate', () => {

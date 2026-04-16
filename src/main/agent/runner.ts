@@ -16,6 +16,78 @@ const DEFAULT_SCORE_THRESHOLD = 85
 const COST_PER_INPUT_TOKEN = 3 / 1_000_000
 const COST_PER_OUTPUT_TOKEN = 15 / 1_000_000
 
+type RoundFailureType =
+  | 'no_generate'
+  | 'no_evaluate'
+  | 'permission_denied'
+  | 'max_turns'
+  | 'query_error'
+  | 'result_error'
+
+interface RoundFailureDiagnosticsInput {
+  generatedImagePath: string | null
+  roundEvalScore: number | null
+  queryError: string | null
+  stopReason: string | null
+  modelTurns: number
+  failureSignals: Set<RoundFailureType>
+}
+
+function normalizeFailureTypes(types: Iterable<RoundFailureType>): RoundFailureType[] {
+  return Array.from(new Set(types))
+}
+
+function buildRoundFailureDiagnostics(input: RoundFailureDiagnosticsInput): {
+  failureTypes: RoundFailureType[]
+  detail: string
+} {
+  const failureTypes = new Set<RoundFailureType>(input.failureSignals)
+  if (!input.generatedImagePath) {
+    failureTypes.add('no_generate')
+  }
+  if (input.generatedImagePath && input.roundEvalScore === null) {
+    failureTypes.add('no_evaluate')
+  }
+  if (input.queryError) {
+    failureTypes.add('query_error')
+  }
+  if (input.stopReason === 'max_tokens' || input.stopReason === 'pause_turn') {
+    failureTypes.add('max_turns')
+  }
+
+  const normalizedFailureTypes = normalizeFailureTypes(failureTypes)
+  const detailParts = [
+    `failure_types=${normalizedFailureTypes.join(',') || 'unknown'}`,
+    `stop_reason=${input.stopReason ?? 'null'}`,
+    `num_turns=${input.modelTurns}`,
+    `query_error=${input.queryError ?? 'none'}`,
+  ]
+  return {
+    failureTypes: normalizedFailureTypes,
+    detail: detailParts.join(', '),
+  }
+}
+
+function buildFinalFallbackPrompt(input: TaskInput, lastDefectAnalysis: DefectAnalysis | null): string {
+  const defectHint =
+    lastDefectAnalysis && Array.isArray(lastDefectAnalysis.dimensions)
+      ? lastDefectAnalysis.dimensions
+          .flatMap((dimension) => dimension.issues.slice(0, 1))
+          .filter((issue) => issue.trim().length > 0)
+          .slice(0, 3)
+          .join('; ')
+      : ''
+
+  return defectHint
+    ? `Generate a realistic e-commerce image for ${input.productName} in ${input.context}. Fix previous issues: ${defectHint}.`
+    : `Generate a realistic e-commerce image for ${input.productName} in ${input.context}.`
+}
+
+function buildAttemptSummary(roundsAttempted: number, maxRetries: number): string {
+  const maxRounds = maxRetries + 1
+  return `${roundsAttempted}/${maxRounds}`
+}
+
 export async function runAgentLoop(
   input: TaskInput,
   win: BrowserWindow,
@@ -38,6 +110,7 @@ export async function runAgentLoop(
   await fs.mkdir(failedDir, { recursive: true })
 
   let retryCount = 0
+  let roundsAttempted = 0
   const maxRetries =
     typeof options.maxRetries === 'number' && Number.isInteger(options.maxRetries)
       ? Math.max(0, options.maxRetries)
@@ -49,6 +122,7 @@ export async function runAgentLoop(
   let lastDefectAnalysis: DefectAnalysis | null = null
   let lastImagePath: string | null = null
   let totalCostUsd = 0
+  let terminalFailureReason: string | null = null
 
   const pushEvent = (event: LoopEvent): void => {
     if (!win.isDestroyed()) {
@@ -90,6 +164,9 @@ export async function runAgentLoop(
     }
 
     const roundIndex = retryCount
+    const isLastRound = roundIndex >= maxRetries
+    roundsAttempted = roundIndex + 1
+
     const systemPrompt = buildSystemPrompt({
       productName: input.productName,
       context: input.context,
@@ -105,7 +182,7 @@ export async function runAgentLoop(
       taskId,
       phase: 'thought',
       message:
-        `[第 ${roundIndex + 1} 轮] 开始推理 → 商品: ${input.productName}` +
+        `[第 ${roundIndex + 1} 轮] 开始推理 -> 商品: ${input.productName}` +
         `（通过阈值 >= ${scoreThreshold}，最大重试 ${maxRetries}）`,
       retryCount,
       roundIndex,
@@ -115,6 +192,10 @@ export async function runAgentLoop(
     let generatedImagePath: string | null = null
     let roundEvalScore: number | null = null
     let roundDefect: DefectAnalysis | null = null
+    let queryError: string | null = null
+    let lastStopReason: string | null = null
+    let modelTurns = 0
+    const failureSignals = new Set<RoundFailureType>()
 
     const toolDefs = mcpServer.tools.map((t) => ({
       name: t.name,
@@ -133,7 +214,7 @@ export async function runAgentLoop(
         content:
           `生成电商精品图：商品名称=${input.productName}，场景=${input.context}，SKU=${input.skuId}。` +
           imagePathsHint +
-          `\n生成图片后立即调用 evaluate_image 工具进行质量评估。`,
+          '\n生成图片后立即调用 evaluate_image 工具进行质量评估。',
       },
     ]
 
@@ -141,19 +222,29 @@ export async function runAgentLoop(
     while (continueLoop) {
       if (signal.aborted) break
 
-      const response = await anthropic.messages.create({
-        model: options.anthropicModel ?? 'claude-sonnet-4-20250514',
-        max_tokens: 4096,
-        system: systemPrompt,
-        tools: toolDefs,
-        messages,
-      })
+      let response: Awaited<ReturnType<typeof anthropic.messages.create>>
+      try {
+        response = await anthropic.messages.create({
+          model: options.anthropicModel ?? 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          system: systemPrompt,
+          tools: toolDefs,
+          messages,
+        })
+      } catch (error: unknown) {
+        queryError = error instanceof Error ? error.message : String(error)
+        failureSignals.add('query_error')
+        continueLoop = false
+        break
+      }
 
+      modelTurns += 1
+      lastStopReason = response.stop_reason
       totalCostUsd +=
         response.usage.input_tokens * COST_PER_INPUT_TOKEN +
         response.usage.output_tokens * COST_PER_OUTPUT_TOKEN
 
-      if (response.stop_reason === 'end_turn' || response.stop_reason !== 'tool_use') {
+      if (response.stop_reason !== 'tool_use') {
         continueLoop = false
         break
       }
@@ -182,6 +273,10 @@ export async function runAgentLoop(
                   ...(block.input as Record<string, unknown>),
                   product_image_paths: productImagePaths,
                   ...(referenceImagePaths?.length ? { reference_image_paths: referenceImagePaths } : {}),
+                  product_name: input.productName,
+                  context: input.context,
+                  rubric: options.evaluationRubric,
+                  pass_threshold: scoreThreshold,
                 }
               : block.name === 'evaluate_image'
                 ? {
@@ -244,7 +339,7 @@ export async function runAgentLoop(
               pushEvent({
                 taskId,
                 phase: 'observe',
-                message: `generate_image 调试信息: ${details}`,
+                message: `generate_image debug: ${details}`,
                 retryCount,
                 roundIndex,
                 timestamp: Date.now(),
@@ -268,10 +363,21 @@ export async function runAgentLoop(
           })
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : String(err)
+          if (block.name === 'generate_image') {
+            failureSignals.add('no_generate')
+          }
+          if (block.name === 'evaluate_image') {
+            failureSignals.add('no_evaluate')
+          }
+          if (/permission|denied|forbidden/i.test(errMsg)) {
+            failureSignals.add('permission_denied')
+          }
+          failureSignals.add('result_error')
+
           pushEvent({
             taskId,
             phase: 'observe',
-            message: `${block.name} 执行失败：${errMsg}`,
+            message: `${block.name} 执行失败: ${errMsg}`,
             retryCount,
             roundIndex,
             timestamp: Date.now(),
@@ -326,10 +432,14 @@ export async function runAgentLoop(
         })
       } catch (error: unknown) {
         const errMsg = error instanceof Error ? error.message : String(error)
+        if (/permission|denied|forbidden/i.test(errMsg)) {
+          failureSignals.add('permission_denied')
+        }
+        failureSignals.add('no_evaluate')
         pushEvent({
           taskId,
           phase: 'observe',
-          message: `自动评估失败：${errMsg}`,
+          message: `自动评估失败: ${errMsg}`,
           retryCount,
           roundIndex,
           timestamp: Date.now(),
@@ -338,15 +448,94 @@ export async function runAgentLoop(
     }
 
     if (!generatedImagePath || roundEvalScore === null || !roundDefect) {
+      const diagnostics = buildRoundFailureDiagnostics({
+        generatedImagePath,
+        roundEvalScore,
+        queryError,
+        stopReason: lastStopReason,
+        modelTurns,
+        failureSignals,
+      })
+
+      if (!isLastRound) {
+        pushEvent({
+          taskId,
+          phase: 'observe',
+          message: `Round incomplete, continue retry. ${diagnostics.detail}`,
+          retryCount,
+          roundIndex,
+          costUsd: totalCostUsd,
+          timestamp: Date.now(),
+        })
+        retryCount += 1
+        continue
+      }
+
       pushEvent({
         taskId,
-        phase: 'failed',
-        message: 'Agent 未完成完整 generate+evaluate 循环',
+        phase: 'observe',
+        message: `Last round fallback start. ${diagnostics.detail}`,
         retryCount,
         roundIndex,
+        costUsd: totalCostUsd,
         timestamp: Date.now(),
       })
-      break
+
+      try {
+        if (!generatedImagePath) {
+          const generated = (await mcpServer.callTool('generate_image', {
+            prompt: buildFinalFallbackPrompt(input, lastDefectAnalysis),
+            product_image_paths: productImagePaths,
+            ...(referenceImagePaths?.length ? { reference_image_paths: referenceImagePaths } : {}),
+            product_name: input.productName,
+            context: input.context,
+            rubric: options.evaluationRubric,
+            pass_threshold: scoreThreshold,
+          })) as { image_path: string }
+          generatedImagePath = generated.image_path
+          lastImagePath = generatedImagePath
+
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message: 'Last round fallback generated image',
+            retryCount,
+            roundIndex,
+            generatedImagePath,
+            previewImagePath: generatedImagePath,
+            timestamp: Date.now(),
+          })
+        }
+
+        if (!generatedImagePath) {
+          throw new Error('fallback generate_image returned empty path')
+        }
+
+        if (roundEvalScore === null || !roundDefect) {
+          const evalRes = (await mcpServer.callTool('evaluate_image', {
+            image_path: generatedImagePath,
+            product_name: input.productName,
+            context: input.context,
+            rubric: options.evaluationRubric,
+            pass_threshold: scoreThreshold,
+          })) as { total_score: number; defect_analysis: DefectAnalysis }
+          roundEvalScore = evalRes.total_score
+          roundDefect = evalRes.defect_analysis
+
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message: 'Last round fallback evaluated image',
+            retryCount,
+            roundIndex,
+            timestamp: Date.now(),
+          })
+        }
+      } catch (error: unknown) {
+        const errMsg = error instanceof Error ? error.message : String(error)
+        terminalFailureReason = `last_round_fallback_failed: ${errMsg}`
+        break
+      }
     }
 
     pushEvent({
@@ -377,7 +566,7 @@ export async function runAgentLoop(
       pushEvent({
         taskId,
         phase: 'success',
-        message: `任务成功！评分 ${roundEvalScore}，总费用 $${totalCostUsd.toFixed(4)}`,
+        message: `任务成功，评分 ${roundEvalScore}，总费用 $${totalCostUsd.toFixed(4)}`,
         score: roundEvalScore,
         costUsd: totalCostUsd,
         retryCount,
@@ -390,7 +579,7 @@ export async function runAgentLoop(
     }
 
     lastDefectAnalysis = roundDefect
-    retryCount++
+    retryCount += 1
   }
 
   if (lastImagePath) {
@@ -398,10 +587,13 @@ export async function runAgentLoop(
     await fs.copyFile(lastImagePath, destPath)
   }
   await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
+
+  const attemptSummary = buildAttemptSummary(Math.max(1, roundsAttempted), maxRetries)
+  const reasonSuffix = terminalFailureReason ? `，原因：${terminalFailureReason}` : ''
   pushEvent({
     taskId,
     phase: 'failed',
-    message: `任务失败：已重试 ${maxRetries} 次，总费用 $${totalCostUsd.toFixed(4)}`,
+    message: `任务失败：已尝试 ${attemptSummary} 轮，总费用 $${totalCostUsd.toFixed(4)}${reasonSuffix}`,
     costUsd: totalCostUsd,
     retryCount,
     roundIndex: retryCount,

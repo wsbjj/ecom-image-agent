@@ -65,6 +65,14 @@ class EvalResponse(BaseModel):
     defect_analysis: DefectAnalysis
 
 
+def configure_stdio_utf8() -> None:
+    """Force UTF-8 stdio for cross-platform child-process logging stability."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
 def load_env_file(env_path: Path) -> None:
     """从 .env 读取配置并注入环境变量（不覆盖已有系统变量）。"""
     if not env_path.exists():
@@ -224,6 +232,8 @@ def evaluate_image(
 
 
 def main() -> None:
+    configure_stdio_utf8()
+
     parser = argparse.ArgumentParser(description="VLMEvalKit JSON Lines 评估服务")
     parser.add_argument("--workdir", required=True, help="工作目录路径")
     args = parser.parse_args()
@@ -235,19 +245,19 @@ def main() -> None:
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        sys.stderr.write("[VLMEval] ANTHROPIC_API_KEY 未设置\n")
+        sys.stderr.write("[VLMEval] missing_required_env key=ANTHROPIC_API_KEY\n")
         sys.exit(1)
     model_name = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
     base_url = os.environ.get("ANTHROPIC_BASE_URL")
     if base_url:
-        sys.stderr.write(f"[VLMEval] 使用自定义 ANTHROPIC_BASE_URL: {base_url}\n")
+        sys.stderr.write(f"[VLMEval] using_custom_base_url value={base_url}\n")
         client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
     else:
         client = anthropic.Anthropic(api_key=api_key)
 
-    sys.stderr.write(f"[VLMEval] 使用模型: {model_name}\n")
-    sys.stderr.write("[VLMEval] 服务启动，等待请求...\n")
+    sys.stderr.write(f"[VLMEval] model={model_name}\n")
+    sys.stderr.write("[VLMEval] service_started status=ready\n")
     sys.stderr.flush()
 
     for line in sys.stdin:
@@ -269,7 +279,7 @@ def main() -> None:
             error_resp = {"request_id": request_id, "error": f"JSON 解析失败: {e}"}
             sys.stdout.write(json.dumps(error_resp, ensure_ascii=False) + "\n")
         except Exception as e:  # noqa: BLE001
-            sys.stderr.write(f"[VLMEval] 处理错误: {e}\n")
+            sys.stderr.write(f"[VLMEval] processing_error error={e}\n")
             error_resp = {"request_id": request_id, "error": str(e)}
             sys.stdout.write(json.dumps(error_resp, ensure_ascii=False) + "\n")
         finally:

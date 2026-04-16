@@ -19,6 +19,11 @@ export interface GenerateImageResult {
     productImageCount?: number
     referenceImageCount?: number
     usedCompositeImage?: boolean
+    candidateTotalCount?: number
+    candidateAttemptedCount?: number
+    candidateSucceededCount?: number
+    selectedCandidateIndex?: number
+    selectedCandidateScore?: number
   }
 }
 

@@ -4,6 +4,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { IPC_CHANNELS } from '../../shared/ipc-channels'
+import { parseEvalRubricMarkdown } from '../../shared/eval-rubric-markdown'
 import { SeedreamProvider } from '../agent/providers/seedream.provider'
 import { SeedreamVisualProvider } from '../agent/providers/seedream-visual.provider'
 import {
@@ -310,7 +311,13 @@ export function registerConfigHandlers(): void {
   ipcMain.handle(
     IPC_CHANNELS.EVAL_TEMPLATE_SAVE,
     async (_event, template: EvaluationTemplateInput): Promise<{ success: boolean }> => {
-      await insertEvaluationTemplate(template)
+      const rubric = parseEvalRubricMarkdown(template.rubricMarkdown)
+      await insertEvaluationTemplate({
+        name: template.name,
+        version: template.version,
+        defaultThreshold: template.defaultThreshold,
+        rubric,
+      })
       return { success: true }
     },
   )

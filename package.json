@@ -5,6 +5,7 @@
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:win:utf8": "cmd /c \"chcp 65001>nul && set PYTHONUTF8=1 && set PYTHONIOENCODING=utf-8 && electron-vite dev\"",
     "postinstall": "electron-builder install-app-deps",
     "build": "electron-vite build",
     "preview": "electron-vite preview",

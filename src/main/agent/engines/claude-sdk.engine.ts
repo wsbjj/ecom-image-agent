@@ -20,6 +20,88 @@ import type { AgentEngine, EngineRuntimeOptions } from './types'
 
 const DEFAULT_MODEL = 'claude-sonnet-4-20250514'
 const DEFAULT_MAX_ORIGINAL_ROUNDS = 12
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+const DEFAULT_MAX_TURNS = 8
+
+type RoundFailureType =
+  | 'no_generate'
+  | 'no_evaluate'
+  | 'permission_denied'
+  | 'max_turns'
+  | 'query_error'
+  | 'result_error'
+
+interface ResultDiagnostics {
+  failureTypes: RoundFailureType[]
+  detail: string
+}
+
+interface RoundFailureDiagnosticsInput {
+  generatedImagePath: string | null
+  roundEvalScore: number | null
+  queryError: string | null
+  resultDiagnostics: ResultDiagnostics | null
+}
+
+type PushEventFn = (event: LoopEvent) => void
+
+function normalizeFailureTypes(types: Iterable<RoundFailureType>): RoundFailureType[] {
+  return Array.from(new Set(types))
+}
+
+function buildRoundFailureDiagnostics(input: RoundFailureDiagnosticsInput): {
+  failureTypes: RoundFailureType[]
+  detail: string
+} {
+  const failureTypes = new Set<RoundFailureType>()
+  if (!input.generatedImagePath) {
+    failureTypes.add('no_generate')
+  }
+  if (input.generatedImagePath && input.roundEvalScore === null) {
+    failureTypes.add('no_evaluate')
+  }
+  if (input.queryError) {
+    failureTypes.add('query_error')
+  }
+  if (input.resultDiagnostics) {
+    for (const failureType of input.resultDiagnostics.failureTypes) {
+      failureTypes.add(failureType)
+    }
+  }
+
+  const normalizedFailureTypes = normalizeFailureTypes(failureTypes)
+  const detailParts = [
+    `failure_types=${normalizedFailureTypes.join(',') || 'unknown'}`,
+    `query_error=${input.queryError ?? 'none'}`,
+  ]
+  if (input.resultDiagnostics) {
+    detailParts.push(input.resultDiagnostics.detail)
+  }
+  return {
+    failureTypes: normalizedFailureTypes,
+    detail: detailParts.join(', '),
+  }
+}
+
+function buildFinalFallbackPrompt(input: TaskInput, lastDefectAnalysis: DefectAnalysis | null): string {
+  const defectHint =
+    lastDefectAnalysis && Array.isArray(lastDefectAnalysis.dimensions)
+      ? lastDefectAnalysis.dimensions
+          .flatMap((dimension) => dimension.issues.slice(0, 1))
+          .filter((issue) => issue.trim().length > 0)
+          .slice(0, 3)
+          .join('; ')
+      : ''
+
+  return defectHint
+    ? `Generate a realistic e-commerce image for ${input.productName} in ${input.context}. Fix previous issues: ${defectHint}.`
+    : `Generate a realistic e-commerce image for ${input.productName} in ${input.context}.`
+}
+
+function buildAttemptSummary(roundsAttempted: number, maxRetries: number): string {
+  const maxRounds = maxRetries + 1
+  return `${roundsAttempted}/${maxRounds}`
+}
 
 export class ClaudeSdkAgentEngine implements AgentEngine {
   readonly name = 'claude_sdk' as const
@@ -37,7 +119,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
     await fs.mkdir(readyDir, { recursive: true })
     await fs.mkdir(failedDir, { recursive: true })
 
-    const pushEvent = (event: LoopEvent): void => {
+    const pushEvent: PushEventFn = (event) => {
       if (!win.isDestroyed()) {
         win.webContents.send(IPC_CHANNELS.AGENT_LOOP_EVENT, event)
       }
@@ -67,25 +149,29 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       .filter((a): a is string => Boolean(a))
 
     let retryCount = 0
+    let roundsAttempted = 0
     let lastDefectAnalysis: DefectAnalysis | null = null
     let lastImagePath: string | null = null
     let totalCostUsd = 0
+    let terminalFailureReason: string | null = null
 
     while (retryCount <= options.maxRetries) {
-      const roundIndex = retryCount
-
       if (signal.aborted) {
         pushEvent({
           taskId,
           phase: 'failed',
-          message: '任务已手动中止',
+          message: 'Task aborted by user',
           retryCount,
-          roundIndex,
+          roundIndex: retryCount,
           timestamp: Date.now(),
         })
         await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
         return
       }
+
+      const roundIndex = retryCount
+      const isLastRound = roundIndex >= options.maxRetries
+      roundsAttempted = roundIndex + 1
 
       const memoryBlock = memoryLedger.buildMemoryPromptBlock()
       const systemPrompt = buildSystemPrompt({
@@ -99,15 +185,15 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
         rubricDimensions: options.evaluationRubric.dimensions,
       })
       const composedSystemPrompt = memoryBlock
-        ? `${systemPrompt}\n\n## 多轮记忆上下文\n${memoryBlock}`
+        ? `${systemPrompt}\n\n## Multi-round memory\n${memoryBlock}`
         : systemPrompt
 
       pushEvent({
         taskId,
         phase: 'thought',
         message:
-          `Claude SDK 推理开始 → 商品: ${input.productName}` +
-          `（通过阈值 >= ${options.scoreThreshold}，最大重试 ${options.maxRetries}）`,
+          `Round ${roundIndex + 1} started with Claude SDK. product=${input.productName}` +
+          `, pass_threshold=${options.scoreThreshold}, max_retries=${options.maxRetries}`,
         retryCount,
         roundIndex,
         timestamp: Date.now(),
@@ -121,12 +207,13 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       let resultMessage: SDKResultMessage | null = null
       let queryError: string | null = null
 
+      const mcpServerName = `ecom-mcp-${taskId}-${roundIndex}`
       const sdkMcpServer = createSdkMcpServer({
-        name: `ecom-mcp-${taskId}-${roundIndex}`,
+        name: mcpServerName,
         tools: [
           tool(
             'generate_image',
-            '调用图像生成 API 生成电商精品图，返回本地绝对路径。',
+            'Call image generation API and return local absolute file path',
             {
               prompt: z.string(),
               style: z.string().optional(),
@@ -138,7 +225,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
               pushEvent({
                 taskId,
                 phase: 'act',
-                message: `调用 generate_image，参数: ${JSON.stringify(args)}`,
+                message: `generate_image args=${JSON.stringify(args)}`,
                 retryCount,
                 roundIndex,
                 timestamp: Date.now(),
@@ -148,6 +235,10 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
                 ...args,
                 product_image_paths: productImagePaths,
                 ...(referenceImagePaths?.length ? { reference_image_paths: referenceImagePaths } : {}),
+                product_name: input.productName,
+                context: input.context,
+                rubric: options.evaluationRubric,
+                pass_threshold: options.scoreThreshold,
               })) as {
                 image_path: string
                 prompt_used: string
@@ -175,7 +266,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
               pushEvent({
                 taskId,
                 phase: 'observe',
-                message: `第 ${roundIndex + 1} 轮已生成图片`,
+                message: `round ${roundIndex + 1} image generated`,
                 retryCount,
                 roundIndex,
                 generatedImagePath,
@@ -191,7 +282,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
           ),
           tool(
             'evaluate_image',
-            '按评估模板打分，返回总分与缺陷。',
+            'Evaluate generated image quality',
             {
               image_path: z.string().optional(),
               product_name: z.string().optional(),
@@ -201,7 +292,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
               const targetImagePath = (args.image_path ?? generatedImagePath ?? '').trim()
               if (!targetImagePath) {
                 return {
-                  content: [{ type: 'text', text: 'Error: 尚未生成图片，无法评估' }],
+                  content: [{ type: 'text', text: 'Error: no generated image to evaluate' }],
                   isError: true,
                 }
               }
@@ -217,7 +308,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
               pushEvent({
                 taskId,
                 phase: 'observe',
-                message: `调用 evaluate_image，参数: ${JSON.stringify(evalInput)}`,
+                message: `evaluate_image args=${JSON.stringify(evalInput)}`,
                 retryCount,
                 roundIndex,
                 timestamp: Date.now(),
@@ -250,14 +341,13 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
 
       const imagePathsHint =
         productImagePaths.length > 0
-          ? `\n已提供 ${productImagePaths.length} 张白底商品图，调用 generate_image 时请使用这些图片。`
+          ? `\nUse ${productImagePaths.length} product images when calling generate_image.`
           : ''
 
       const prompt =
-        `生成电商精品图：商品名称=${input.productName}，场景=${input.context}，SKU=${input.skuId}。` +
+        `Generate e-commerce image for product=${input.productName}, scene=${input.context}, sku=${input.skuId}.` +
         imagePathsHint +
-        '\n必须严格按顺序调用 generate_image，再调用 evaluate_image；不要只输出文字结论。'
-      const mcpServerName = `ecom-mcp-${roundIndex}`
+        '\nYou must call generate_image first, then call evaluate_image. Do not stop at text output only.'
       const allowedTools = [`mcp__${mcpServerName}__generate_image`, `mcp__${mcpServerName}__evaluate_image`]
 
       const q = query({
@@ -268,7 +358,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
           mcpServers: {
             [mcpServerName]: sdkMcpServer,
           },
-          maxTurns: 8,
+          maxTurns: DEFAULT_MAX_TURNS,
           permissionMode: 'default',
           tools: [],
           allowedTools,
@@ -278,7 +368,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
             }
             return {
               behavior: 'deny',
-              message: `不允许调用工具 ${toolName}，仅允许 generate_image/evaluate_image`,
+              message: `Tool denied: ${toolName}. Only generate_image/evaluate_image are allowed.`,
             }
           },
           env: {
@@ -318,7 +408,10 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
           percentage: usage.percentage,
         }
       } catch {
-        contextUsage = this.deriveContextUsageFromResult(resultMessage)
+        contextUsage = this.deriveContextUsageFromResult(
+          resultMessage,
+          options.anthropicModel ?? DEFAULT_MODEL,
+        )
       } finally {
         q.close()
       }
@@ -331,7 +424,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
         pushEvent({
           taskId,
           phase: 'observe',
-          message: `Claude SDK 执行异常：${queryError}`,
+          message: `Claude SDK query error: ${queryError}`,
           retryCount,
           roundIndex,
           contextUsage,
@@ -340,12 +433,12 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
         })
       }
 
-      const resultDiagnostics = resultMessage ? this.collectResultDiagnostics(resultMessage) : []
-      if (resultDiagnostics.length > 0) {
+      const resultDiagnostics = resultMessage ? this.collectResultDiagnostics(resultMessage) : null
+      if (resultDiagnostics) {
         pushEvent({
           taskId,
           phase: 'observe',
-          message: `Claude SDK 回合诊断：${resultDiagnostics.join('；')}`,
+          message: `Claude SDK round diagnostics: ${resultDiagnostics.detail}`,
           retryCount,
           roundIndex,
           contextUsage,
@@ -374,7 +467,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
           pushEvent({
             taskId,
             phase: 'observe',
-            message: '模型未主动调用 evaluate_image，已自动补充评估',
+            message: 'evaluate_image fallback succeeded',
             retryCount,
             roundIndex,
             contextUsage,
@@ -385,7 +478,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
           pushEvent({
             taskId,
             phase: 'observe',
-            message: `自动评估失败：${err}`,
+            message: `evaluate_image fallback failed: ${err}`,
             retryCount,
             roundIndex,
             contextUsage,
@@ -395,31 +488,70 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       }
 
       if (!generatedImagePath || roundEvalScore === null || !roundDefect) {
-        const missingSteps: string[] = []
-        if (!generatedImagePath) {
-          missingSteps.push('未执行 generate_image')
+        const roundFailure = buildRoundFailureDiagnostics({
+          generatedImagePath,
+          roundEvalScore,
+          queryError,
+          resultDiagnostics,
+        })
+
+        if (!isLastRound) {
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message: `Round incomplete, continue retry. ${roundFailure.detail}`,
+            retryCount,
+            roundIndex,
+            contextUsage,
+            costUsd: totalCostUsd,
+            timestamp: Date.now(),
+          })
+          retryCount += 1
+          continue
         }
-        if (generatedImagePath && roundEvalScore === null) {
-          missingSteps.push('未完成 evaluate_image')
-        }
-        if (resultDiagnostics.length > 0) {
-          missingSteps.push(...resultDiagnostics)
-        }
-        if (queryError) {
-          missingSteps.push(`执行异常：${queryError}`)
-        }
-        const detail = missingSteps.length > 0 ? `（${missingSteps.join('；')}）` : ''
+
         pushEvent({
           taskId,
-          phase: 'failed',
-          message: `Agent 未完成完整 generate+evaluate 循环${detail}`,
+          phase: 'observe',
+          message: `Last round fallback start. ${roundFailure.detail}`,
           retryCount,
           roundIndex,
           contextUsage,
           costUsd: totalCostUsd,
           timestamp: Date.now(),
         })
-        break
+
+        try {
+          const fallbackResult = await this.executeLastRoundFallback({
+            input,
+            taskId,
+            roundIndex,
+            mcpServer,
+            pushEvent,
+            retryCount,
+            generatedImagePath,
+            previewImagePath,
+            contextThumbPath,
+            roundEvalScore,
+            roundDefect,
+            productImagePaths,
+            referenceImagePaths,
+            scoreThreshold: options.scoreThreshold,
+            evaluationRubric: options.evaluationRubric,
+            contextUsage,
+            lastDefectAnalysis,
+          })
+          generatedImagePath = fallbackResult.generatedImagePath
+          previewImagePath = fallbackResult.previewImagePath
+          contextThumbPath = fallbackResult.contextThumbPath
+          roundEvalScore = fallbackResult.roundEvalScore
+          roundDefect = fallbackResult.roundDefect
+          lastImagePath = generatedImagePath
+        } catch (error: unknown) {
+          const err = error instanceof Error ? error.message : String(error)
+          terminalFailureReason = `last_round_fallback_failed: ${err}`
+          break
+        }
       }
 
       await updateTaskRoundArtifactScore({
@@ -439,8 +571,8 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
         promptSummary:
           resultMessage && resultMessage.type === 'result' && resultMessage.subtype === 'success'
             ? resultMessage.result.slice(0, 180)
-            : `第 ${roundIndex + 1} 轮执行完成`,
-        actionSummary: `生成并评估图片，得分 ${roundEvalScore}`,
+            : `round ${roundIndex + 1} completed`,
+        actionSummary: `generated and evaluated image with score ${roundEvalScore}`,
         score: roundEvalScore,
         defectAnalysis: roundDefect,
         keywords,
@@ -454,7 +586,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
           pushEvent({
             taskId,
             phase: 'observe',
-            message: `上下文占用 ${contextUsage.percentage.toFixed(1)}%，触发 ${level.toUpperCase()} 压缩策略`,
+            message: `context usage ${contextUsage.percentage.toFixed(1)}%, compression level=${level.toUpperCase()}`,
             retryCount,
             roundIndex,
             contextUsage,
@@ -472,7 +604,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       pushEvent({
         taskId,
         phase: 'observe',
-        message: `评分结果: ${roundEvalScore} / 100`,
+        message: `score result: ${roundEvalScore} / 100`,
         score: roundEvalScore,
         defectAnalysis: roundDefect,
         retryCount,
@@ -499,7 +631,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
         pushEvent({
           taskId,
           phase: 'success',
-          message: `任务成功！评分 ${roundEvalScore}，总费用 $${totalCostUsd.toFixed(4)}`,
+          message: `Task succeeded with score=${roundEvalScore}, total_cost=$${totalCostUsd.toFixed(4)}`,
           score: roundEvalScore,
           retryCount,
           roundIndex,
@@ -521,10 +653,12 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       await fs.copyFile(lastImagePath, destPath)
     }
     await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
+    const attemptSummary = buildAttemptSummary(Math.max(1, roundsAttempted), options.maxRetries)
+    const reasonSuffix = terminalFailureReason ? `, reason=${terminalFailureReason}` : ''
     pushEvent({
       taskId,
       phase: 'failed',
-      message: `任务失败：已重试 ${options.maxRetries} 次，总费用 $${totalCostUsd.toFixed(4)}`,
+      message: `Task failed after rounds ${attemptSummary}, total_cost=$${totalCostUsd.toFixed(4)}${reasonSuffix}`,
       retryCount,
       roundIndex: retryCount,
       costUsd: totalCostUsd,
@@ -532,33 +666,168 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
     })
   }
 
-  private collectResultDiagnostics(message: SDKResultMessage): string[] {
-    const diagnostics: string[] = []
+  private collectResultDiagnostics(message: SDKResultMessage): ResultDiagnostics {
+    const failureTypes = new Set<RoundFailureType>()
+    const detailParts = [
+      `result_subtype=${message.subtype}`,
+      `num_turns=${message.num_turns}`,
+      `terminal_reason=${message.terminal_reason ?? 'none'}`,
+    ]
 
     if (message.subtype !== 'success') {
-      diagnostics.push(`result=${message.subtype}`)
+      failureTypes.add('result_error')
       if (message.errors.length > 0) {
-        diagnostics.push(`errors=${message.errors.slice(0, 2).join(' | ')}`)
+        detailParts.push(`errors=${message.errors.slice(0, 2).join(' | ')}`)
       }
-      return diagnostics
     }
 
     if (message.permission_denials.length > 0) {
       const deniedTools = Array.from(
         new Set(message.permission_denials.map((item) => item.tool_name.trim()).filter((name) => name.length > 0)),
       )
-      diagnostics.push(`permission_denials=${deniedTools.join(', ')}`)
+      failureTypes.add('permission_denied')
+      detailParts.push(`permission_denials=${deniedTools.join(', ')}`)
+    } else {
+      detailParts.push('permission_denials=none')
     }
 
-    if (message.num_turns >= 8 && !message.deferred_tool_use) {
-      diagnostics.push('达到 maxTurns 但未检测到完整工具链')
+    if (
+      message.subtype === 'error_max_turns' ||
+      message.terminal_reason === 'max_turns' ||
+      (message.num_turns >= DEFAULT_MAX_TURNS &&
+        !(message.subtype === 'success' && Boolean(message.deferred_tool_use)))
+    ) {
+      failureTypes.add('max_turns')
     }
 
-    return diagnostics
+    return {
+      failureTypes: normalizeFailureTypes(failureTypes),
+      detail: detailParts.join(', '),
+    }
+  }
+
+  private async executeLastRoundFallback(params: {
+    input: TaskInput
+    taskId: string
+    roundIndex: number
+    mcpServer: Awaited<ReturnType<typeof createMcpServer>>
+    pushEvent: PushEventFn
+    retryCount: number
+    generatedImagePath: string | null
+    previewImagePath: string | null
+    contextThumbPath: string | null
+    roundEvalScore: number | null
+    roundDefect: DefectAnalysis | null
+    productImagePaths: string[]
+    referenceImagePaths: string[] | undefined
+    scoreThreshold: number
+    evaluationRubric: EngineRuntimeOptions['evaluationRubric']
+    contextUsage: LoopEvent['contextUsage'] | undefined
+    lastDefectAnalysis: DefectAnalysis | null
+  }): Promise<{
+    generatedImagePath: string
+    previewImagePath: string | null
+    contextThumbPath: string | null
+    roundEvalScore: number
+    roundDefect: DefectAnalysis
+  }> {
+    let generatedImagePath = params.generatedImagePath
+    let previewImagePath = params.previewImagePath
+    let contextThumbPath = params.contextThumbPath
+    let roundEvalScore = params.roundEvalScore
+    let roundDefect = params.roundDefect
+
+    if (!generatedImagePath) {
+      const generated = (await params.mcpServer.callTool('generate_image', {
+        prompt: buildFinalFallbackPrompt(params.input, params.lastDefectAnalysis),
+        product_image_paths: params.productImagePaths,
+        ...(params.referenceImagePaths?.length
+          ? { reference_image_paths: params.referenceImagePaths }
+          : {}),
+        product_name: params.input.productName,
+        context: params.input.context,
+        rubric: params.evaluationRubric,
+        pass_threshold: params.scoreThreshold,
+      })) as { image_path: string }
+
+      const artifacts = await persistRoundArtifacts({
+        taskId: params.taskId,
+        roundIndex: params.roundIndex,
+        sourceImagePath: generated.image_path,
+      })
+      generatedImagePath = artifacts.generatedImagePath
+      previewImagePath = artifacts.previewImagePath
+      contextThumbPath = artifacts.contextThumbPath
+
+      await insertTaskRoundArtifact({
+        taskId: params.taskId,
+        roundIndex: params.roundIndex,
+        generatedImagePath,
+        previewImagePath,
+        contextThumbPath,
+        score: null,
+      })
+
+      params.pushEvent({
+        taskId: params.taskId,
+        phase: 'observe',
+        message: 'Last round fallback generated image',
+        retryCount: params.retryCount,
+        roundIndex: params.roundIndex,
+        generatedImagePath,
+        previewImagePath: previewImagePath ?? generatedImagePath,
+        timestamp: Date.now(),
+      })
+    }
+
+    if (!generatedImagePath) {
+      throw new Error('fallback generate_image returned empty path')
+    }
+
+    if (roundEvalScore === null || !roundDefect) {
+      const evalResult = (await params.mcpServer.callTool('evaluate_image', {
+        image_path: generatedImagePath,
+        product_name: params.input.productName,
+        context: params.input.context,
+        rubric: params.evaluationRubric,
+        pass_threshold: params.scoreThreshold,
+      })) as { total_score: number; defect_analysis: DefectAnalysis }
+      roundEvalScore = evalResult.total_score
+      roundDefect = evalResult.defect_analysis
+
+      await updateTaskRoundArtifactScore({
+        taskId: params.taskId,
+        roundIndex: params.roundIndex,
+        score: roundEvalScore,
+        contextUsage: params.contextUsage ? JSON.stringify(params.contextUsage) : null,
+      })
+
+      params.pushEvent({
+        taskId: params.taskId,
+        phase: 'observe',
+        message: 'Last round fallback evaluated image',
+        retryCount: params.retryCount,
+        roundIndex: params.roundIndex,
+        timestamp: Date.now(),
+      })
+    }
+
+    if (roundEvalScore === null || !roundDefect) {
+      throw new Error('fallback evaluate_image returned incomplete result')
+    }
+
+    return {
+      generatedImagePath,
+      previewImagePath,
+      contextThumbPath,
+      roundEvalScore,
+      roundDefect,
+    }
   }
 
   private deriveContextUsageFromResult(
     message: SDKResultMessage | null,
+    modelName: string,
   ): LoopEvent['contextUsage'] | undefined {
     if (!message) return undefined
 
@@ -585,7 +854,11 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       (usage.cacheReadInputTokens ?? usage.cache_read_input_tokens ?? 0) +
       (usage.cacheCreationInputTokens ?? usage.cache_creation_input_tokens ?? 0)
 
-    const maxTokens = usage.contextWindow ?? usage.context_window ?? 0
+    const maxTokensRaw = usage.contextWindow ?? usage.context_window ?? 0
+    const maxTokens =
+      Number.isFinite(maxTokensRaw) && maxTokensRaw > 0
+        ? maxTokensRaw
+        : this.estimateContextWindowTokens(modelName)
 
     if (!Number.isFinite(totalTokens) || !Number.isFinite(maxTokens)) {
       return undefined
@@ -601,6 +874,14 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
     }
   }
 
+  private estimateContextWindowTokens(modelName: string): number {
+    const normalized = modelName.trim().toLowerCase()
+    if (normalized.includes('claude')) {
+      return DEFAULT_CONTEXT_WINDOW_TOKENS
+    }
+    return DEFAULT_CONTEXT_WINDOW_TOKENS
+  }
+
   private handleSdkMessage(
     message: SDKMessage,
     ctx: {
@@ -614,7 +895,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       ctx.pushEvent({
         taskId: ctx.taskId,
         phase: 'observe',
-        message: 'Claude SDK 正在自动压缩上下文',
+        message: 'Claude SDK is compacting context',
         retryCount: ctx.retryCount,
         roundIndex: ctx.roundIndex,
         timestamp: Date.now(),
@@ -625,7 +906,7 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       ctx.pushEvent({
         taskId: ctx.taskId,
         phase: 'observe',
-        message: `触发记忆召回：${message.memories.length} 条`,
+        message: `Memory recall count=${message.memories.length}`,
         retryCount: ctx.retryCount,
         roundIndex: ctx.roundIndex,
         timestamp: Date.now(),

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { TerminalPane } from '../components/TerminalPane'
 import { CsvImporter } from '../components/CsvImporter'
 import { ScoreGauge } from '../components/ScoreGauge'
@@ -35,6 +35,47 @@ function mapArtifactsToPreviews(
   }))
 }
 
+function parseLatestContextUsage(
+  artifacts: Array<{
+    context_usage: string | null
+  }>,
+):
+  | {
+      totalTokens: number
+      maxTokens: number
+      percentage: number
+    }
+  | null {
+  for (let index = artifacts.length - 1; index >= 0; index -= 1) {
+    const raw = artifacts[index].context_usage?.trim()
+    if (!raw) continue
+    try {
+      const parsed = JSON.parse(raw) as {
+        totalTokens?: unknown
+        maxTokens?: unknown
+        percentage?: unknown
+      }
+      if (
+        typeof parsed.totalTokens === 'number' &&
+        Number.isFinite(parsed.totalTokens) &&
+        typeof parsed.maxTokens === 'number' &&
+        Number.isFinite(parsed.maxTokens) &&
+        typeof parsed.percentage === 'number' &&
+        Number.isFinite(parsed.percentage)
+      ) {
+        return {
+          totalTokens: Math.round(parsed.totalTokens),
+          maxTokens: Math.round(parsed.maxTokens),
+          percentage: Math.min(100, Math.max(0, parsed.percentage)),
+        }
+      }
+    } catch {
+      // Ignore malformed historical payload.
+    }
+  }
+  return null
+}
+
 export function TaskRun() {
   const {
     activeTaskId,
@@ -48,6 +89,7 @@ export function TaskRun() {
   } = useAgentStore()
   const agentStartTask = useAgentStore((s) => s.startTask)
   const setRoundPreviews = useAgentStore((s) => s.setRoundPreviews)
+  const setContextUsage = useAgentStore((s) => s.setContextUsage)
 
   const [skuId, setSkuId] = useState('')
   const [productName, setProductName] = useState('')
@@ -61,6 +103,9 @@ export function TaskRun() {
   const [evaluationTemplateId, setEvaluationTemplateId] = useState<number | null>(null)
   const [isBatch, setIsBatch] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [roundPreviewSrcByPath, setRoundPreviewSrcByPath] = useState<Record<string, string>>({})
+  const [selectedRoundPreview, setSelectedRoundPreview] = useState<RoundPreviewItem | null>(null)
+  const loadingRoundPreviewPathsRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     let mounted = true
@@ -120,7 +165,9 @@ export function TaskRun() {
     void window.api
       .queryTaskRoundArtifacts(activeTaskId)
       .then((artifacts) => {
-        if (!mounted || artifacts.length === 0) return
+        if (!mounted) return
+        setContextUsage(parseLatestContextUsage(artifacts))
+        if (artifacts.length === 0) return
         setRoundPreviews(mapArtifactsToPreviews(artifacts))
       })
       .catch(() => {
@@ -130,7 +177,103 @@ export function TaskRun() {
     return () => {
       mounted = false
     }
-  }, [activeTaskId, setRoundPreviews])
+  }, [activeTaskId, setContextUsage, setRoundPreviews])
+
+  useEffect(() => {
+    const activePaths = Array.from(
+      new Set(
+        roundPreviews
+          .flatMap((item) => [item.previewImagePath, item.generatedImagePath])
+          .map((rawPath) => rawPath.trim())
+          .filter((p) => p.length > 0),
+      ),
+    )
+
+    setRoundPreviewSrcByPath((prev) => {
+      const next: Record<string, string> = {}
+      let changed = false
+      for (const imagePath of activePaths) {
+        if (prev[imagePath]) {
+          next[imagePath] = prev[imagePath]
+        }
+      }
+
+      const prevKeys = Object.keys(prev)
+      const nextKeys = Object.keys(next)
+      if (prevKeys.length !== nextKeys.length) {
+        changed = true
+      } else if (!prevKeys.every((key) => key in next)) {
+        changed = true
+      }
+
+      return changed ? next : prev
+    })
+
+    let cancelled = false
+    for (const imagePath of activePaths) {
+      if (roundPreviewSrcByPath[imagePath]) continue
+      if (loadingRoundPreviewPathsRef.current.has(imagePath)) continue
+      loadingRoundPreviewPathsRef.current.add(imagePath)
+      void window.api
+        .readImageAsDataUrl(imagePath)
+        .then((result) => {
+          const dataUrl = result.dataUrl
+          if (cancelled || !dataUrl) return
+          setRoundPreviewSrcByPath((prev) =>
+            prev[imagePath] === dataUrl ? prev : { ...prev, [imagePath]: dataUrl },
+          )
+        })
+        .catch(() => {
+          // Ignore and keep fallback file URL.
+        })
+        .finally(() => {
+          loadingRoundPreviewPathsRef.current.delete(imagePath)
+        })
+    }
+
+    return () => {
+      cancelled = true
+    }
+  }, [roundPreviews, roundPreviewSrcByPath])
+
+  const resolveRoundPreviewSrc = useCallback(
+    (rawPath: string | null | undefined): string => {
+      const normalizedPath = rawPath?.trim()
+      if (!normalizedPath) return ''
+      return roundPreviewSrcByPath[normalizedPath] ?? toFileUrl(normalizedPath)
+    },
+    [roundPreviewSrcByPath],
+  )
+
+  const resolveRoundItemPreviewSrc = useCallback(
+    (item: RoundPreviewItem): string =>
+      resolveRoundPreviewSrc(item.previewImagePath) || resolveRoundPreviewSrc(item.generatedImagePath),
+    [resolveRoundPreviewSrc],
+  )
+
+  useEffect(() => {
+    if (!selectedRoundPreview) return
+
+    const stillExists = roundPreviews.some((item) => item.roundIndex === selectedRoundPreview.roundIndex)
+    if (!stillExists) {
+      setSelectedRoundPreview(null)
+    }
+  }, [roundPreviews, selectedRoundPreview])
+
+  useEffect(() => {
+    if (!selectedRoundPreview) return
+
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        setSelectedRoundPreview(null)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [selectedRoundPreview])
 
   const handleStart = useCallback(async () => {
     if (!productName.trim() || !skuId.trim()) {
@@ -368,27 +511,39 @@ export function TaskRun() {
           <div className="rounded-lg border border-gray-700/50 bg-gray-900/30 p-3">
             <div className="text-xs text-gray-400 mb-3">轮次生成时间线（仅 generate_image 输出）</div>
             {roundPreviews.length === 0 ? (
-              <div className="text-xs text-gray-500">暂无轮次图片</div>
+              <div className="text-xs text-gray-500" data-testid="round-preview-empty">暂无轮次图片</div>
             ) : (
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+              <div className="flex flex-wrap gap-2.5" data-testid="round-preview-timeline">
                 {roundPreviews.map((item) => (
-                  <div key={item.roundIndex} className="rounded-md border border-gray-700/60 overflow-hidden">
+                  <button
+                    key={item.roundIndex}
+                    type="button"
+                    aria-label={`Open round ${item.roundIndex + 1} preview`}
+                    title={`Round ${item.roundIndex + 1}`}
+                    className="group w-36 sm:w-40 rounded-md border border-gray-700/60 overflow-hidden text-left bg-gray-900/40 hover:border-gray-500/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/70 transition-colors"
+                    onClick={() => setSelectedRoundPreview(item)}
+                  >
                     <img
-                      src={toFileUrl(item.previewImagePath)}
+                      src={resolveRoundItemPreviewSrc(item)}
                       alt={`round-${item.roundIndex + 1}`}
-                      className="w-full aspect-square object-cover"
+                      className="w-full h-24 sm:h-28 object-cover transition-transform duration-200 group-hover:scale-[1.02]"
+                      onError={(event) => {
+                        const fallbackSrc = resolveRoundPreviewSrc(item.generatedImagePath)
+                        if (fallbackSrc && event.currentTarget.src !== fallbackSrc) {
+                          event.currentTarget.src = fallbackSrc
+                        }
+                      }}
                     />
                     <div className="px-2 py-1.5 text-[11px] bg-gray-900/80 text-gray-300 flex justify-between">
                       <span>第 {item.roundIndex + 1} 轮</span>
                       <span>{item.score !== null ? `${item.score}` : '--'}</span>
                     </div>
-                  </div>
+                  </button>
                 ))}
               </div>
             )}
           </div>
         </div>
-
         <div className="w-72 border-l border-gray-700/50 p-4 space-y-6">
           <div className="relative flex items-center justify-center">
             <ScoreGauge score={currentScore} passThreshold={scoreThreshold} />
@@ -446,6 +601,51 @@ export function TaskRun() {
           </div>
         </div>
       </div>
+
+      {selectedRoundPreview && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          data-testid="round-preview-overlay"
+          onClick={() => setSelectedRoundPreview(null)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Round ${selectedRoundPreview.roundIndex + 1} image preview`}
+            className="relative w-full max-w-5xl rounded-xl border border-gray-700 bg-gray-900/95 p-3 sm:p-4"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              aria-label="Close preview"
+              className="absolute right-2 top-2 rounded-md border border-gray-600/80 bg-gray-800/80 px-2 py-1 text-sm text-gray-200 hover:bg-gray-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/70"
+              onClick={() => setSelectedRoundPreview(null)}
+            >
+              ×
+            </button>
+
+            <div className="mb-2 pr-10 text-xs text-gray-300 flex items-center justify-between">
+              <span>第 {selectedRoundPreview.roundIndex + 1} 轮</span>
+              <span>{selectedRoundPreview.score !== null ? `${selectedRoundPreview.score}` : '--'}</span>
+            </div>
+
+            <div className="rounded-lg bg-black/40 p-2 flex items-center justify-center">
+              <img
+                src={resolveRoundItemPreviewSrc(selectedRoundPreview)}
+                alt={`round-${selectedRoundPreview.roundIndex + 1}-full`}
+                className="max-h-[80vh] w-auto max-w-full object-contain rounded-md"
+                onError={(event) => {
+                  const fallbackSrc = resolveRoundPreviewSrc(selectedRoundPreview.generatedImagePath)
+                  if (fallbackSrc && event.currentTarget.src !== fallbackSrc) {
+                    event.currentTarget.src = fallbackSrc
+                  }
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
+

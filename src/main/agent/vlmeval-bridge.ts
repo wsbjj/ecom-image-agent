@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import * as path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { app } from 'electron'
 import type {
   EvalRequest,
@@ -53,6 +54,8 @@ export class VLMEvalBridge {
   private proc: ChildProcessWithoutNullStreams | null = null
   private pendingRequests = new Map<string, PendingResolver>()
   private rl: readline.Interface | null = null
+  private stderrDecoder = new StringDecoder('utf8')
+  private stderrBuffer = ''
 
   async start(
     pythonPath: string,
@@ -75,10 +78,11 @@ export class VLMEvalBridge {
       )
       if (installDeps.status !== 0) {
         const detail = installDeps.stderr || installDeps.stdout || 'unknown pip error'
-        throw new Error(`安装 Python 依赖失败: ${detail}`)
+        throw new Error(`Failed to install Python dependencies: ${detail}`)
       }
     }
 
+    this.resetStderrDecoderState()
     this.proc = spawn(pythonPath, ['-X', 'utf8', scriptPath, '--workdir', workDir], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
@@ -97,13 +101,17 @@ export class VLMEvalBridge {
     })
 
     this.proc.stderr.on('data', (chunk: Buffer) => {
-      process.stderr.write(`[VLMEval] ${chunk.toString()}`)
+      this.handleStderrChunk(chunk)
+    })
+    this.proc.stderr.on('end', () => {
+      this.flushStderrDecoder()
     })
 
     this.proc.on('exit', (code) => {
-      console.warn(`[VLMEval] 子进程退出，code=${String(code)}`)
+      this.flushStderrDecoder()
+      console.warn(`[VLMEval] subprocess_exited code=${String(code)}`)
       this.proc = null
-      const err = new Error(`VLMEval 子进程意外退出 code=${String(code)}`)
+      const err = new Error(`VLMEval subprocess exited unexpectedly code=${String(code)}`)
       for (const [id, pending] of this.pendingRequests) {
         clearTimeout(pending.timer)
         pending.reject(err)
@@ -149,13 +157,13 @@ export class VLMEvalBridge {
 
   evaluate(req: EvalRequest): Promise<EvalResult> {
     if (!this.proc) {
-      return Promise.reject(new Error('VLMEval 子进程未启动'))
+      return Promise.reject(new Error('VLMEval subprocess is not running'))
     }
 
     return new Promise<EvalResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(req.requestId)
-        reject(new Error(`VLMEval 评估超时 (${EVAL_TIMEOUT_MS}ms)`))
+        reject(new Error(`VLMEval evaluation timeout (${EVAL_TIMEOUT_MS}ms)`))
       }, EVAL_TIMEOUT_MS)
 
       this.pendingRequests.set(req.requestId, { resolve, reject, timer })
@@ -179,11 +187,47 @@ export class VLMEvalBridge {
       this.proc.kill('SIGTERM')
       this.proc = null
     }
+    this.flushStderrDecoder()
     for (const [id, pending] of this.pendingRequests) {
       clearTimeout(pending.timer)
       pending.reject(new Error('VLMEval bridge stopped'))
       this.pendingRequests.delete(id)
     }
+  }
+
+  private resetStderrDecoderState(): void {
+    this.stderrDecoder = new StringDecoder('utf8')
+    this.stderrBuffer = ''
+  }
+
+  private writePrefixedStderrLine(rawLine: string): void {
+    const line = rawLine.replace(/\r$/, '').trim()
+    if (!line) return
+    const rendered = line.startsWith('[VLMEval]') ? line : `[VLMEval] ${line}`
+    process.stderr.write(`${rendered}\n`)
+  }
+
+  private handleStderrChunk(chunk: Buffer): void {
+    const decoded = this.stderrDecoder.write(chunk)
+    if (!decoded) return
+
+    this.stderrBuffer += decoded
+    const lines = this.stderrBuffer.split('\n')
+    this.stderrBuffer = lines.pop() ?? ''
+    for (const line of lines) {
+      this.writePrefixedStderrLine(line)
+    }
+  }
+
+  private flushStderrDecoder(): void {
+    const tail = this.stderrDecoder.end()
+    if (tail) {
+      this.stderrBuffer += tail
+    }
+    if (this.stderrBuffer) {
+      this.writePrefixedStderrLine(this.stderrBuffer)
+    }
+    this.resetStderrDecoderState()
   }
 }
 

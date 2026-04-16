@@ -13,27 +13,15 @@ const {
       getSize: () => ({ width, height }),
       resize: (options: { width?: number; height?: number }) =>
         makeNativeImage(options.width ?? width, options.height ?? height),
-      toBitmap: () => Buffer.alloc(width * height * 4, 255),
       toJPEG: () => Buffer.alloc(1024, 1),
     }
   }
 
-  const createFromPath = vi.fn((filePath: string) => {
-    if (filePath.includes('empty')) {
-      return {
-        isEmpty: () => true,
-        getSize: () => ({ width: 0, height: 0 }),
-        resize: () => makeNativeImage(0, 0),
-        toBitmap: () => Buffer.alloc(0),
-        toJPEG: () => Buffer.alloc(0),
-      }
-    }
-    return makeNativeImage(1200, 800)
-  })
-  const createFromBitmap = vi.fn(
-    (_bitmap: Buffer, options: { width: number; height: number }) =>
-      makeNativeImage(options.width, options.height),
+  const createFromPath = vi.fn((_filePath: string) => makeNativeImage(1200, 800))
+  const createFromBitmap = vi.fn((_bitmap: Buffer, options: { width: number; height: number }) =>
+    makeNativeImage(options.width, options.height),
   )
+
   return {
     mockMkdir: vi.fn(),
     mockWriteFile: vi.fn(),
@@ -72,7 +60,7 @@ describe('SeedreamVisualProvider', () => {
     mockStat.mockResolvedValue({ size: 1024 * 1024 })
   })
 
-  it('routes to I2I and submits seededit_v3.0 body when input images exist', async () => {
+  it('sends I2I with per-image binary_data_base64 items and does not compose images', async () => {
     const capturedBodies: Record<string, unknown>[] = []
 
     vi.stubGlobal(
@@ -130,15 +118,92 @@ describe('SeedreamVisualProvider', () => {
     const pollBody = capturedBodies[1]
     expect(submitBody?.req_key).toBe('seededit_v3.0')
     expect(Array.isArray(submitBody?.binary_data_base64)).toBe(true)
-    expect((submitBody?.binary_data_base64 as string[])?.length).toBe(1)
+    expect((submitBody?.binary_data_base64 as string[]).length).toBe(3)
     expect(submitBody?.scale).toBe(0.5)
     expect(pollBody?.req_key).toBe('seededit_v3.0')
 
     expect(result.debugInfo?.providerMode).toBe('visual_official')
     expect(result.debugInfo?.visualRoute).toBe('i2i')
-    expect(result.debugInfo?.usedCompositeImage).toBe(true)
+    expect(result.debugInfo?.usedCompositeImage).toBe(false)
     expect(result.debugInfo?.productImageCount).toBe(2)
     expect(result.debugInfo?.referenceImageCount).toBe(1)
+    expect(mockCreateFromBitmap).not.toHaveBeenCalled()
+  })
+
+  it('retries with single input when multi-image submit is rejected', async () => {
+    const submitBodies: Record<string, unknown>[] = []
+    let submitCallCount = 0
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.includes('Action=CVSync2AsyncSubmitTask')) {
+          submitCallCount += 1
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          submitBodies.push(body)
+          if (submitCallCount === 1) {
+            return {
+              status: 200,
+              text: async () =>
+                JSON.stringify({
+                  code: 40001,
+                  message: 'invalid binary_data_base64 parameter',
+                  request_id: 'req-submit-1',
+                  data: null,
+                }),
+            }
+          }
+          return {
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                code: 10000,
+                message: 'Success',
+                request_id: 'req-submit-2',
+                data: { task_id: 'task-2' },
+              }),
+          }
+        }
+        if (url.includes('Action=CVSync2AsyncGetResult')) {
+          return {
+            status: 200,
+            text: async () =>
+              JSON.stringify({
+                code: 10000,
+                message: 'Success',
+                request_id: 'req-poll-2',
+                data: { status: 'done', image_urls: ['https://cdn.example.com/out.jpg'] },
+              }),
+          }
+        }
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => new Uint8Array([7, 8, 9]).buffer,
+        }
+      }),
+    )
+
+    const provider = new SeedreamVisualProvider({
+      accessKeyId: 'AK_TEST',
+      secretAccessKey: 'SK_TEST',
+      reqKey: 'high_aes_general_v30l_zt2i',
+    })
+
+    const result = await provider.generate({
+      prompt: 'Retry with single image if needed',
+      productImagePaths: ['/product-1.jpg', '/product-2.jpg'],
+      referenceImagePaths: ['/ref-1.png', '/ref-2.png'],
+      aspectRatio: '1:1',
+    })
+
+    expect(submitCallCount).toBe(2)
+    expect((submitBodies[0].binary_data_base64 as string[]).length).toBe(4)
+    expect((submitBodies[1].binary_data_base64 as string[]).length).toBe(1)
+    expect(result.debugInfo?.fallbackReason).toBe(
+      'visual_i2i_multi_input_rejected_retry_with_single_input',
+    )
+    expect(result.debugInfo?.usedCompositeImage).toBe(false)
   })
 
   it('keeps T2I route when no image inputs', async () => {
@@ -156,7 +221,7 @@ describe('SeedreamVisualProvider', () => {
                 code: 10000,
                 message: 'Success',
                 request_id: 'req-submit',
-                data: { task_id: 'task-2' },
+                data: { task_id: 'task-3' },
               }),
           }
         }

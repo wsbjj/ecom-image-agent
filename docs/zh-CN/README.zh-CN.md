@@ -63,6 +63,12 @@ pip install -r requirements.txt
 npm run dev
 ```
 
+Windows 终端若出现 `浣跨敤...` 这类乱码，优先使用 UTF-8 启动脚本：
+
+```bash
+npm run dev:win:utf8
+```
+
 ## 构建与测试
 
 ```bash
@@ -74,6 +80,10 @@ npm run test
 npm run test:watch
 npm run test:coverage
 ```
+
+## 模板编写说明
+
+- 评估模板 Markdown 编写说明：[`docs/zh-CN/EVAL_TEMPLATE_MARKDOWN_GUIDE.zh-CN.md`](./EVAL_TEMPLATE_MARKDOWN_GUIDE.zh-CN.md)
 
 ## 运行时输出目录
 

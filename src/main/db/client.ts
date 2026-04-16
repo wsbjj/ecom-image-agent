@@ -16,6 +16,10 @@ import {
   up as up004,
   down as down004,
 } from './migrations/004_add_eval_templates_and_round_artifacts'
+import {
+  up as up005,
+  down as down005,
+} from './migrations/005_reset_evaluation_templates_for_markdown'
 
 export interface TaskTable {
   id: Generated<number>
@@ -85,6 +89,7 @@ class InlineMigrationProvider implements MigrationProvider {
       '002_create_templates': { up: up002, down: down002 },
       '003_add_image_fields': { up: up003, down: down003 },
       '004_add_eval_templates_and_round_artifacts': { up: up004, down: down004 },
+      '005_reset_evaluation_templates_for_markdown': { up: up005, down: down005 },
     })
   }
 }

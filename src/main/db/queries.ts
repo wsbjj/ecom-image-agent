@@ -3,7 +3,6 @@ import type {
   TaskRecord,
   TemplateRecord,
   TemplateInput,
-  EvaluationTemplateInput,
   EvaluationTemplateRecord,
   TaskRoundArtifactRecord,
   EvalRubric,
@@ -159,7 +158,12 @@ export async function deleteTemplate(id: number): Promise<void> {
   await db.deleteFrom('templates').where('id', '=', id).execute()
 }
 
-export async function insertEvaluationTemplate(input: EvaluationTemplateInput): Promise<void> {
+export async function insertEvaluationTemplate(input: {
+  name: string
+  version: number
+  defaultThreshold: number
+  rubric: EvalRubric
+}): Promise<void> {
   await db
     .insertInto('evaluation_templates')
     .values({

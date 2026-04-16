@@ -10,14 +10,15 @@ const VISUAL_ENDPOINT = `https://${VISUAL_HOST}`
 const VISUAL_SERVICE = 'cv'
 const VISUAL_REGION = 'cn-north-1'
 const VISUAL_VERSION = '2022-08-31'
+
 const DEFAULT_T2I_REQ_KEY = 'high_aes_general_v30l_zt2i'
 const I2I_REQ_KEY = 'seededit_v3.0'
 const I2I_DEFAULT_SCALE = 0.5
 const I2I_DEFAULT_SEED = -1
+
 const MAX_I2I_INPUT_BYTES = 5 * 1024 * 1024
 const MAX_I2I_INPUT_DIMENSION = 4096
-const MIN_COMPOSITE_SIDE = 512
-const MAX_COMPOSITE_SIDE = 1536
+const MIN_RESIZE_SIDE = 512
 const POLL_TIMEOUT_MS = 120_000
 
 const ASPECT_TO_SIZE: Record<string, { width: number; height: number }> = {
@@ -76,7 +77,7 @@ function formatAmzDate(now: Date): { shortDate: string; longDate: string } {
   const iso = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
   return {
     shortDate: iso.slice(0, 8),
-    longDate: iso.slice(0, 15) + 'Z',
+    longDate: `${iso.slice(0, 15)}Z`,
   }
 }
 
@@ -100,7 +101,7 @@ function parseVisualResponsePayload<TData>(
   } catch {
     return {
       code: httpStatus,
-      message: `Visual API 返回非 JSON 响应: ${payloadText.slice(0, 200)}`,
+      message: `Visual API returned non-JSON payload: ${payloadText.slice(0, 200)}`,
       data: null,
     }
   }
@@ -108,7 +109,7 @@ function parseVisualResponsePayload<TData>(
   if (typeof payload !== 'object' || payload === null) {
     return {
       code: httpStatus,
-      message: `Visual API 返回了无效响应结构: ${String(payload).slice(0, 200)}`,
+      message: `Visual API returned invalid payload: ${String(payload).slice(0, 200)}`,
       data: null,
     }
   }
@@ -138,7 +139,7 @@ function parseVisualResponsePayload<TData>(
 
   return {
     code: httpStatus,
-    message: `Visual API 返回未知结构: ${payloadText.slice(0, 200)}`,
+    message: `Visual API returned unknown payload shape: ${payloadText.slice(0, 200)}`,
     data: null,
   }
 }
@@ -166,32 +167,6 @@ function supportedImageExt(filePath: string): boolean {
   return ext === '.jpg' || ext === '.jpeg' || ext === '.png'
 }
 
-function blitBitmap(
-  target: Buffer,
-  targetWidth: number,
-  targetHeight: number,
-  source: Buffer,
-  sourceWidth: number,
-  sourceHeight: number,
-  offsetX: number,
-  offsetY: number,
-): void {
-  for (let y = 0; y < sourceHeight; y += 1) {
-    const destY = y + offsetY
-    if (destY < 0 || destY >= targetHeight) continue
-    for (let x = 0; x < sourceWidth; x += 1) {
-      const destX = x + offsetX
-      if (destX < 0 || destX >= targetWidth) continue
-      const srcIndex = (y * sourceWidth + x) * 4
-      const dstIndex = (destY * targetWidth + destX) * 4
-      target[dstIndex] = source[srcIndex]
-      target[dstIndex + 1] = source[srcIndex + 1]
-      target[dstIndex + 2] = source[srcIndex + 2]
-      target[dstIndex + 3] = source[srcIndex + 3]
-    }
-  }
-}
-
 function encodeJpegWithLimit(image: Electron.NativeImage): Buffer {
   const qualities = [90, 80, 70, 60, 50, 40]
   let working = image
@@ -203,14 +178,14 @@ function encodeJpegWithLimit(image: Electron.NativeImage): Buffer {
       }
     }
     const size = working.getSize()
-    const nextWidth = Math.max(MIN_COMPOSITE_SIDE, Math.floor(size.width * 0.85))
-    const nextHeight = Math.max(MIN_COMPOSITE_SIDE, Math.floor(size.height * 0.85))
+    const nextWidth = Math.max(MIN_RESIZE_SIDE, Math.floor(size.width * 0.85))
+    const nextHeight = Math.max(MIN_RESIZE_SIDE, Math.floor(size.height * 0.85))
     if (nextWidth === size.width && nextHeight === size.height) {
       break
     }
     working = working.resize({ width: nextWidth, height: nextHeight, quality: 'good' })
   }
-  throw new Error('I2I 输入图压缩失败：无法将合成图控制在 5MB 以内')
+  throw new Error('Visual I2I input image cannot be compressed under 5MB')
 }
 
 export class SeedreamVisualProvider implements ImageProvider {
@@ -234,7 +209,7 @@ export class SeedreamVisualProvider implements ImageProvider {
 
   async generate(params: GenerateImageParams): Promise<GenerateImageResult> {
     if (!this.accessKeyId || !this.secretAccessKey) {
-      return this.callFallback(params, '官方 Visual 缺少 AccessKey/SecretKey')
+      return this.callFallback(params, 'Official Visual missing AccessKey/SecretKey')
     }
 
     const productCount = params.productImagePaths.length
@@ -247,11 +222,10 @@ export class SeedreamVisualProvider implements ImageProvider {
     try {
       const visualRoute: 't2i' | 'i2i' = hasInputImages ? 'i2i' : 't2i'
       let submitBody: Record<string, unknown>
-      let usedCompositeImage = false
+      let fallbackReason: string | undefined
+
       if (visualRoute === 'i2i') {
-        const i2i = await this.buildI2ISubmitBody(params, fullPrompt)
-        submitBody = i2i.body
-        usedCompositeImage = i2i.usedCompositeImage
+        submitBody = (await this.buildI2ISubmitBody(params, fullPrompt)).body
       } else {
         submitBody = {
           req_key: this.reqKey,
@@ -263,11 +237,26 @@ export class SeedreamVisualProvider implements ImageProvider {
         }
       }
 
-      const submit = await this.postActionWithRetry<SubmitTaskData>('CVSync2AsyncSubmitTask', submitBody)
+      let submit: VisualApiResponse<SubmitTaskData>
+      if (visualRoute === 'i2i') {
+        try {
+          submit = await this.postActionWithRetry<SubmitTaskData>('CVSync2AsyncSubmitTask', submitBody)
+        } catch (error: unknown) {
+          if (this.shouldRetryI2IWithSingleInput(error, params)) {
+            const singleInputBody = await this.buildSingleInputI2ISubmitBody(params, fullPrompt)
+            submit = await this.postActionWithRetry<SubmitTaskData>('CVSync2AsyncSubmitTask', singleInputBody)
+            fallbackReason = 'visual_i2i_multi_input_rejected_retry_with_single_input'
+          } else {
+            throw error
+          }
+        }
+      } else {
+        submit = await this.postActionWithRetry<SubmitTaskData>('CVSync2AsyncSubmitTask', submitBody)
+      }
 
       const taskId = submit.data?.task_id
       if (!taskId) {
-        throw new Error(`提交任务成功但未返回 task_id，request_id=${submit.request_id ?? 'unknown'}`)
+        throw new Error(`Visual submit succeeded but task_id is missing, request_id=${submit.request_id ?? 'unknown'}`)
       }
 
       const result = await this.pollResult(taskId, visualRoute === 'i2i' ? I2I_REQ_KEY : this.reqKey)
@@ -284,7 +273,7 @@ export class SeedreamVisualProvider implements ImageProvider {
       } else {
         const response = await fetch(imageUrl)
         if (!response.ok) {
-          throw new Error(`下载生成图片失败: HTTP ${response.status}`)
+          throw new Error(`Download generated image failed: HTTP ${response.status}`)
         }
         const buffer = Buffer.from(await response.arrayBuffer())
         await fs.writeFile(imagePath, buffer)
@@ -298,17 +287,18 @@ export class SeedreamVisualProvider implements ImageProvider {
           requestId,
           taskId,
           visualRoute,
+          fallbackReason,
           productImageCount: productCount,
           referenceImageCount: referenceCount,
-          usedCompositeImage,
+          usedCompositeImage: false,
         },
       }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
       if (isAuthLikeError(message)) {
-        throw new Error(`官方 Visual 鉴权失败，请检查 AK/SK 或权限配置：${message}`)
+        throw new Error(`Official Visual auth failed. Check AK/SK and IAM permission: ${message}`)
       }
-      return this.callFallback(params, `官方 Visual 调用失败：${message}`)
+      return this.callFallback(params, `Official Visual request failed: ${message}`)
     }
   }
 
@@ -331,130 +321,131 @@ export class SeedreamVisualProvider implements ImageProvider {
     } catch (fallbackError: unknown) {
       const fallbackMessage =
         fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
-      throw new Error(`${reason}；回退 openai_compat 也失败：${fallbackMessage}`)
+      throw new Error(`${reason}; fallback openai_compat also failed: ${fallbackMessage}`)
     }
   }
 
-  private buildI2IPrompt(
-    basePrompt: string,
-    productCount: number,
-    referenceCount: number,
-  ): string {
+  private buildI2IPrompt(basePrompt: string, productCount: number, referenceCount: number): string {
     return [
-      `严格保持商品主体一致性（形状、材质、比例、关键细节）`,
-      `商品图数量=${productCount}，参考风格图数量=${referenceCount}`,
-      referenceCount > 0 ? '参考图仅用于风格、光影、色彩和构图，不改变商品主体。' : '',
-      `生成目标：${basePrompt}`,
+      'Strictly preserve product identity (shape, material, proportions, and key details).',
+      `Product image count=${productCount}, reference image count=${referenceCount}.`,
+      referenceCount > 0
+        ? 'Reference images are for style/lighting/color/composition only; do not alter product identity.'
+        : '',
+      `Target: ${basePrompt}`,
     ]
       .filter((text) => text.length > 0)
-      .join('。')
+      .join(' ')
   }
 
-  private async loadValidatedImage(imagePath: string): Promise<ReturnType<typeof nativeImage.createFromPath>> {
+  private async loadValidatedImage(imagePath: string): Promise<Electron.NativeImage> {
     if (!supportedImageExt(imagePath)) {
-      throw new Error(`Visual I2I 仅支持 JPG/PNG 输入: ${imagePath}`)
+      throw new Error(`Visual I2I only supports JPG/PNG input: ${imagePath}`)
     }
     const stat = await fs.stat(imagePath)
     if (stat.size > MAX_I2I_INPUT_BYTES) {
-      throw new Error(`Visual I2I 输入图不能超过 5MB: ${imagePath}`)
+      throw new Error(`Visual I2I input image exceeds 5MB: ${imagePath}`)
     }
-    const img = nativeImage.createFromPath(imagePath)
-    if (img.isEmpty()) {
-      throw new Error(`无法读取图片: ${imagePath}`)
+    const image = nativeImage.createFromPath(imagePath)
+    if (image.isEmpty()) {
+      throw new Error(`Cannot read image: ${imagePath}`)
     }
-    const { width, height } = img.getSize()
+    const { width, height } = image.getSize()
     if (width <= 0 || height <= 0) {
-      throw new Error(`图片尺寸无效: ${imagePath}`)
+      throw new Error(`Invalid image size: ${imagePath}`)
     }
     if (width > MAX_I2I_INPUT_DIMENSION || height > MAX_I2I_INPUT_DIMENSION) {
-      throw new Error(`Visual I2I 输入图分辨率不能超过 4096x4096: ${imagePath}`)
+      throw new Error(`Visual I2I input resolution exceeds 4096x4096: ${imagePath}`)
     }
     const ratio = Math.max(width, height) / Math.min(width, height)
     if (ratio > 3) {
-      throw new Error(`Visual I2I 输入图长宽比不能超过 3:1: ${imagePath}`)
+      throw new Error(`Visual I2I input aspect ratio exceeds 3:1: ${imagePath}`)
     }
-    return img
+    return image
   }
 
-  private createBlankBitmap(width: number, height: number): Buffer {
-    const bitmap = Buffer.alloc(width * height * 4)
-    for (let i = 0; i < bitmap.length; i += 4) {
-      bitmap[i] = 255
-      bitmap[i + 1] = 255
-      bitmap[i + 2] = 255
-      bitmap[i + 3] = 255
+  private isMultiInputValidationError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error)
+    return /invalid|illegal|parameter|param|argument|binary_data_base64|image/i.test(message)
+  }
+
+  private shouldRetryI2IWithSingleInput(error: unknown, params: GenerateImageParams): boolean {
+    const inputCount = params.productImagePaths.length + (params.referenceImagePaths?.length ?? 0)
+    return inputCount > 1 && this.isMultiInputValidationError(error)
+  }
+
+  private pickSingleInputPaths(params: GenerateImageParams): {
+    productImagePaths: string[]
+    referenceImagePaths: string[]
+  } {
+    if (params.productImagePaths.length > 0) {
+      return {
+        productImagePaths: [params.productImagePaths[0]],
+        referenceImagePaths: [],
+      }
     }
-    return bitmap
+    if ((params.referenceImagePaths?.length ?? 0) > 0) {
+      return {
+        productImagePaths: [],
+        referenceImagePaths: [params.referenceImagePaths![0]],
+      }
+    }
+    throw new Error('Visual I2I requires at least one input image')
   }
 
-  private composeImages(images: ReturnType<typeof nativeImage.createFromPath>[]): ReturnType<typeof nativeImage.createFromBitmap> {
-    const count = images.length
-    const cols = Math.ceil(Math.sqrt(count))
-    const rows = Math.ceil(count / cols)
-    const cell = Math.max(
-      Math.floor(MIN_COMPOSITE_SIDE / Math.max(cols, rows)),
-      Math.floor(MAX_COMPOSITE_SIDE / Math.max(cols, rows)),
-    )
-    const width = cols * cell
-    const height = rows * cell
-    const bitmap = this.createBlankBitmap(width, height)
-
-    images.forEach((img, index) => {
-      const row = Math.floor(index / cols)
-      const col = index % cols
-      const x0 = col * cell
-      const y0 = row * cell
-      const { width: srcW, height: srcH } = img.getSize()
-      const scale = Math.min(cell / srcW, cell / srcH)
-      const targetW = Math.max(1, Math.floor(srcW * scale))
-      const targetH = Math.max(1, Math.floor(srcH * scale))
-      const resized = img.resize({ width: targetW, height: targetH, quality: 'good' })
-      const srcBitmap = resized.toBitmap()
-      const offsetX = x0 + Math.floor((cell - targetW) / 2)
-      const offsetY = y0 + Math.floor((cell - targetH) / 2)
-      blitBitmap(bitmap, width, height, srcBitmap, targetW, targetH, offsetX, offsetY)
-    })
-
-    return nativeImage.createFromBitmap(bitmap, { width, height, scaleFactor: 1 })
+  private async encodeValidatedImageToBase64(imagePath: string): Promise<string> {
+    const image = await this.loadValidatedImage(imagePath)
+    return encodeJpegWithLimit(image).toString('base64')
   }
 
-  private async buildI2IBase64Image(
+  private async buildI2IBase64Images(
     productImagePaths: string[],
     referenceImagePaths: string[],
-  ): Promise<{ base64: string; usedCompositeImage: boolean }> {
+  ): Promise<string[]> {
     const allPaths = [...productImagePaths, ...referenceImagePaths]
     if (allPaths.length === 0) {
-      throw new Error('Visual I2I 至少需要 1 张输入图')
+      throw new Error('Visual I2I requires at least one input image')
     }
-    const loaded = await Promise.all(allPaths.map((imagePath) => this.loadValidatedImage(imagePath)))
-    const image = loaded.length > 1 ? this.composeImages(loaded) : loaded[0]
-    const encoded = encodeJpegWithLimit(image)
-    return {
-      base64: encoded.toString('base64'),
-      usedCompositeImage: loaded.length > 1,
-    }
+    return Promise.all(allPaths.map((imagePath) => this.encodeValidatedImageToBase64(imagePath)))
   }
 
   private async buildI2ISubmitBody(
     params: GenerateImageParams,
     fullPrompt: string,
-  ): Promise<{ body: Record<string, unknown>; usedCompositeImage: boolean }> {
+  ): Promise<{ body: Record<string, unknown> }> {
     const productCount = params.productImagePaths.length
     const referenceCount = params.referenceImagePaths?.length ?? 0
-    const { base64, usedCompositeImage } = await this.buildI2IBase64Image(
+    const base64Images = await this.buildI2IBase64Images(
       params.productImagePaths,
       params.referenceImagePaths ?? [],
     )
+
     return {
       body: {
         req_key: I2I_REQ_KEY,
-        binary_data_base64: [base64],
+        binary_data_base64: base64Images,
         prompt: this.buildI2IPrompt(fullPrompt, productCount, referenceCount),
         seed: I2I_DEFAULT_SEED,
         scale: I2I_DEFAULT_SCALE,
       },
-      usedCompositeImage,
     }
+  }
+
+  private async buildSingleInputI2ISubmitBody(
+    params: GenerateImageParams,
+    fullPrompt: string,
+  ): Promise<Record<string, unknown>> {
+    const picked = this.pickSingleInputPaths(params)
+    const single = await this.buildI2ISubmitBody(
+      {
+        ...params,
+        productImagePaths: picked.productImagePaths,
+        referenceImagePaths:
+          picked.referenceImagePaths.length > 0 ? picked.referenceImagePaths : undefined,
+      },
+      fullPrompt,
+    )
+    return single.body
   }
 
   private async pollResult(taskId: string, reqKey: string): Promise<{ imageUrl: string; requestId?: string }> {
@@ -462,14 +453,11 @@ export class SeedreamVisualProvider implements ImageProvider {
     let delayMs = 1200
 
     while (Date.now() - startedAt < POLL_TIMEOUT_MS) {
-      const result = await this.postActionWithRetry<GetResultData>(
-        'CVSync2AsyncGetResult',
-        {
-          req_key: reqKey,
-          task_id: taskId,
-          req_json: JSON.stringify({ return_url: true }),
-        },
-      )
+      const result = await this.postActionWithRetry<GetResultData>('CVSync2AsyncGetResult', {
+        req_key: reqKey,
+        task_id: taskId,
+        req_json: JSON.stringify({ return_url: true }),
+      })
 
       const status = result.data?.status
       if (status === 'in_queue' || status === 'generating') {
@@ -487,17 +475,17 @@ export class SeedreamVisualProvider implements ImageProvider {
         if (base64) {
           return { imageUrl: `data:image/jpeg;base64,${base64}`, requestId: result.request_id }
         }
-        throw new Error(`任务已完成但未返回图片，request_id=${result.request_id ?? 'unknown'}`)
+        throw new Error(`Task completed but no image payload returned, request_id=${result.request_id ?? 'unknown'}`)
       }
 
       if (status === 'not_found' || status === 'expired') {
-        throw new Error(`任务状态异常: ${status}, task_id=${taskId}`)
+        throw new Error(`Task status is ${status}, task_id=${taskId}`)
       }
 
-      throw new Error(`未知任务状态: ${String(status)}`)
+      throw new Error(`Unknown task status: ${String(status)}`)
     }
 
-    throw new Error(`任务轮询超时 (${POLL_TIMEOUT_MS}ms), task_id=${taskId}`)
+    throw new Error(`Polling timeout (${POLL_TIMEOUT_MS}ms), task_id=${taskId}`)
   }
 
   private async postActionWithRetry<TData>(
@@ -520,11 +508,11 @@ export class SeedreamVisualProvider implements ImageProvider {
       }
 
       throw new Error(
-        `Visual API 调用失败: code=${response.code}, message=${response.message}, request_id=${response.request_id ?? 'unknown'}`,
+        `Visual API request failed: code=${response.code}, message=${response.message}, request_id=${response.request_id ?? 'unknown'}`,
       )
     }
 
-    throw new Error(`Visual API 调用失败，超过最大重试次数: ${action}`)
+    throw new Error(`Visual API request failed after max retries: ${action}`)
   }
 
   private async postAction<TData>(
@@ -532,7 +520,7 @@ export class SeedreamVisualProvider implements ImageProvider {
     body: Record<string, unknown>,
   ): Promise<VisualApiResponse<TData>> {
     if (!this.accessKeyId || !this.secretAccessKey) {
-      throw new Error('Visual API 缺少 AccessKey/SecretKey')
+      throw new Error('Visual API missing AccessKey/SecretKey')
     }
 
     const query = buildCanonicalQuery({
@@ -553,24 +541,11 @@ export class SeedreamVisualProvider implements ImageProvider {
       '',
     ].join('\n')
 
-    const canonicalRequest = [
-      'POST',
-      '/',
-      query,
-      canonicalHeaders,
-      signedHeaders,
-      bodyHash,
-    ].join('\n')
+    const canonicalRequest = ['POST', '/', query, canonicalHeaders, signedHeaders, bodyHash].join('\n')
 
     const credentialScope = `${shortDate}/${VISUAL_REGION}/${VISUAL_SERVICE}/request`
-    const stringToSign = [
-      'HMAC-SHA256',
-      longDate,
-      credentialScope,
-      sha256Hex(canonicalRequest),
-    ].join('\n')
+    const stringToSign = ['HMAC-SHA256', longDate, credentialScope, sha256Hex(canonicalRequest)].join('\n')
 
-    // Volcengine Signature V4 uses raw secret key for the date key derivation.
     const kDate = hmacBuffer(this.secretAccessKey, shortDate)
     const kRegion = hmacBuffer(kDate, VISUAL_REGION)
     const kService = hmacBuffer(kRegion, VISUAL_SERVICE)
@@ -578,8 +553,8 @@ export class SeedreamVisualProvider implements ImageProvider {
     const signature = hmacHex(kSigning, stringToSign)
 
     const authorization = `HMAC-SHA256 Credential=${this.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
-
     const url = `${VISUAL_ENDPOINT}?${query}`
+
     const resp = await fetch(url, {
       method: 'POST',
       headers: {

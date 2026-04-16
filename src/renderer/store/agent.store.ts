@@ -27,6 +27,7 @@ interface AgentActions {
   startTask: (taskId: string) => void
   reset: () => void
   setRoundPreviews: (items: RoundPreviewItem[]) => void
+  setContextUsage: (usage: ContextUsageSnapshot | null) => void
 }
 
 const INITIAL_STATE: AgentState = {
@@ -97,6 +98,12 @@ export const useAgentStore = create<AgentState & AgentActions>()(
       set((state) => ({
         ...state,
         roundPreviews: [...items].sort((a, b) => a.roundIndex - b.roundIndex),
+      })),
+
+    setContextUsage: (usage: ContextUsageSnapshot | null) =>
+      set((state) => ({
+        ...state,
+        contextUsage: usage,
       })),
 
     startTask: (taskId: string) => set({ ...INITIAL_STATE, activeTaskId: taskId, isRunning: true }),
