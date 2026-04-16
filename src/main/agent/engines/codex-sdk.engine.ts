@@ -1,5 +1,6 @@
 import { app, type BrowserWindow } from 'electron'
 import type { Codex as CodexClient, Usage as CodexUsage } from '@openai/codex-sdk'
+import Anthropic from '@anthropic-ai/sdk'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { IPC_CHANNELS } from '../../../shared/ipc-channels'
@@ -18,8 +19,13 @@ import type { AgentEngine, EngineRuntimeOptions } from './types'
 import { buildEnforcedGenerationPrompt, buildFallbackDraftPrompt } from '../enforced-generation-prompt'
 
 const DEFAULT_MODEL = 'gpt-5.4'
+const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-20250514'
 const DEFAULT_MAX_ORIGINAL_ROUNDS = 12
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+const CODEX_QUERY_MAX_ATTEMPTS = 3
+const CODEX_QUERY_BACKOFF_BASE_MS = 1_000
+const CODEX_OPEN_GATEWAY_CIRCUIT_ON_502 = true
+const DRAFT_PROMPT_LOG_MAX_CHARS = 280
 
 type RoundFailureType = 'no_generate' | 'no_evaluate' | 'query_error' | 'parse_error'
 
@@ -54,6 +60,17 @@ interface CompressionThresholds {
 
 type CompressionMode = 'none' | 'soft' | 'hard' | 'critical'
 type PushEventFn = (event: LoopEvent) => void
+type DraftPromptSource = 'codex' | 'anthropic' | 'fallback_template'
+type CodexTurnInputItem = { type: 'text'; text: string } | { type: 'local_image'; path: string }
+
+interface ParsedCodexQueryError {
+  raw: string
+  statusCode: number | null
+  url: string | null
+  requestId: string | null
+  retriable: boolean
+  isGateway502: boolean
+}
 
 const DRAFT_OUTPUT_SCHEMA = {
   type: 'object',
@@ -81,6 +98,88 @@ async function createCodexClient(options: {
 }): Promise<CodexClient> {
   const Codex = await getCodexCtor()
   return new Codex(options)
+}
+
+function parseCodexQueryError(error: unknown): ParsedCodexQueryError {
+  const raw = error instanceof Error ? error.message : String(error)
+  const statusMatch =
+    raw.match(/\bstatus\s+(\d{3})\b/i) ??
+    raw.match(/\bstatus=(\d{3})\b/i) ??
+    raw.match(/\bhttp\s+(\d{3})\b/i) ??
+    raw.match(/\bcode\s+(\d{3})\b/i)
+  const requestIdMatch =
+    raw.match(/\brequest id:\s*([a-z0-9-]+)/i) ?? raw.match(/\brequest_id=([a-z0-9-]+)/i)
+  const urlMatch = raw.match(/\burl:\s*([^,\s]+)/i) ?? raw.match(/\burl=([^,\s]+)/i)
+
+  const statusCode = statusMatch?.[1] ? Number.parseInt(statusMatch[1], 10) : null
+  const messageLower = raw.toLowerCase()
+  const retriableByStatus = statusCode !== null && [408, 429, 500, 502, 503, 504].includes(statusCode)
+  const retriableByKeyword = [
+    'timeout',
+    'timed out',
+    'econnreset',
+    'econnrefused',
+    'enotfound',
+    'socket hang up',
+    'temporarily unavailable',
+    'upstream request failed',
+    'bad gateway',
+    'gateway timeout',
+    'service unavailable',
+    'network error',
+  ].some((keyword) => messageLower.includes(keyword))
+
+  const isGateway502 = statusCode === 502 || messageLower.includes('bad gateway')
+
+  return {
+    raw,
+    statusCode,
+    url: urlMatch?.[1] ?? null,
+    requestId: requestIdMatch?.[1] ?? null,
+    retriable: retriableByStatus || retriableByKeyword,
+    isGateway502,
+  }
+}
+
+function summarizeDraftPromptForLog(prompt: string, maxChars = DRAFT_PROMPT_LOG_MAX_CHARS): string {
+  const compact = prompt.replace(/\s+/g, ' ').trim()
+  if (compact.length <= maxChars) {
+    return compact
+  }
+  return `${compact.slice(0, maxChars)}...`
+}
+
+function extractAnthropicText(content: ReadonlyArray<{ type: string; text?: string }>): string {
+  return content
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text?.trim() ?? '')
+    .filter((text) => text.length > 0)
+    .join('\n')
+    .trim()
+}
+
+async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0) return
+  if (signal.aborted) return
+
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, ms)
+
+    const onAbort = () => {
+      cleanup()
+      resolve()
+    }
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+    }
+
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function normalizeFailureTypes(types: Iterable<RoundFailureType>): RoundFailureType[] {
@@ -156,6 +255,16 @@ function normalizeImagePaths(paths: string[]): string[] {
     .filter((item) => item.length > 0)
 }
 
+function collectAdditionalDirectories(imagePaths: string[]): string[] {
+  return Array.from(
+    new Set(
+      imagePaths
+        .map((imagePath) => path.dirname(imagePath).trim())
+        .filter((dirPath) => dirPath.length > 0),
+    ),
+  )
+}
+
 function pickCompressionMode(usagePercentage: number, thresholds: CompressionThresholds): CompressionMode {
   if (usagePercentage >= thresholds.critical) return 'critical'
   if (usagePercentage >= thresholds.hard) return 'hard'
@@ -169,6 +278,7 @@ function buildRoundUserInstruction(params: {
   scoreThreshold: number
   defectAnalysis: DefectAnalysis | null
   productImageCount: number
+  referenceImageCount: number
   compressionMode: CompressionMode
 }): string {
   const issueHints = normalizeIssueList(params.defectAnalysis)
@@ -187,19 +297,50 @@ function buildRoundUserInstruction(params: {
           ? '\nContext usage is rising. Keep this round concise.'
           : ''
 
-  const productImageHint =
-    params.productImageCount > 0
-      ? `\nUse ${params.productImageCount} product images when generating the draft prompt.`
-      : ''
+  const imageHints: string[] = []
+  if (params.productImageCount > 0) {
+    imageHints.push(
+      `Attached product images: ${params.productImageCount}. Use them as the source of truth for product fidelity.`,
+    )
+  }
+  if (params.referenceImageCount > 0) {
+    imageHints.push(
+      `Attached reference images: ${params.referenceImageCount}. Use them only for style/composition cues.`,
+    )
+  }
+  const imageHintBlock = imageHints.length > 0 ? `\n${imageHints.join('\n')}` : ''
 
   return (
     `Round ${params.roundIndex + 1}: generate an e-commerce image for product=${params.input.productName}, scene=${params.input.context}, sku=${params.input.skuId}.` +
-    productImageHint +
+    imageHintBlock +
     issueBlock +
     compressionHint +
     `\nTarget pass threshold is ${params.scoreThreshold}.` +
     '\nReturn a strict JSON object with field `draft_prompt` only.'
   )
+}
+
+function buildCodexTurnInput(params: {
+  baseSystemPrompt: string
+  roundInstruction: string
+  productImagePaths: string[]
+  referenceImagePaths: string[]
+}): CodexTurnInputItem[] {
+  const inputItems: CodexTurnInputItem[] = [
+    {
+      type: 'text',
+      text: `${params.baseSystemPrompt}\n\n${params.roundInstruction}`,
+    },
+  ]
+
+  for (const imagePath of params.productImagePaths) {
+    inputItems.push({ type: 'local_image', path: imagePath })
+  }
+  for (const imagePath of params.referenceImagePaths) {
+    inputItems.push({ type: 'local_image', path: imagePath })
+  }
+
+  return inputItems
 }
 
 function parseDraftPrompt(rawText: string): string | null {
@@ -273,6 +414,11 @@ export class CodexSdkAgentEngine implements AgentEngine {
     const referenceImagePaths = input.referenceImages
       ? normalizeImagePaths(input.referenceImages.map((img) => img.path))
       : undefined
+    const codexReferenceImagePaths = referenceImagePaths ?? []
+    const additionalDirectories = collectAdditionalDirectories([
+      ...productImagePaths,
+      ...codexReferenceImagePaths,
+    ])
     const productImageAngles = input.productImages
       .map((img) => img.angle)
       .filter((item): item is string => Boolean(item))
@@ -301,6 +447,8 @@ export class CodexSdkAgentEngine implements AgentEngine {
     let terminalFailureReason: string | null = null
     let latestContextUsagePercentage = 0
     const retainedRoundIndexes: number[] = []
+    let codexGatewayCircuitOpen = false
+    let codexGatewayCircuitOpenReason: string | null = null
 
     const model = options.codexModel ?? DEFAULT_MODEL
     const codex = await createCodexClient({
@@ -313,6 +461,7 @@ export class CodexSdkAgentEngine implements AgentEngine {
       skipGitRepoCheck: true,
       sandboxMode: 'read-only',
       approvalPolicy: 'never',
+      ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
     })
 
     pushEvent({
@@ -348,7 +497,14 @@ export class CodexSdkAgentEngine implements AgentEngine {
         scoreThreshold: options.scoreThreshold,
         defectAnalysis: lastDefectAnalysis,
         productImageCount: productImagePaths.length,
+        referenceImageCount: codexReferenceImagePaths.length,
         compressionMode,
+      })
+      const codexTurnInput = buildCodexTurnInput({
+        baseSystemPrompt,
+        roundInstruction,
+        productImagePaths,
+        referenceImagePaths: codexReferenceImagePaths,
       })
 
       const activeRoundState = createActiveRoundState(roundIndex, retryCount)
@@ -368,22 +524,91 @@ export class CodexSdkAgentEngine implements AgentEngine {
       let resultDiagnostics: ResultDiagnostics | null = null
       let draftPrompt: string | null = null
 
-      try {
-        const turn = await thread.run(
-          `${baseSystemPrompt}\n\n${roundInstruction}`,
-          {
-            outputSchema: DRAFT_OUTPUT_SCHEMA,
-            signal,
-          },
-        )
+      let draftSource: DraftPromptSource = 'fallback_template'
+      let lastCodexQueryError: ParsedCodexQueryError | null = null
+      let codexTurn: Awaited<ReturnType<typeof thread.run>> | null = null
+      let unrecoverableCodexError: string | null = null
 
-        contextUsage = this.deriveContextUsageFromUsage(turn.usage, model)
+      if (codexGatewayCircuitOpen) {
+        pushEvent({
+          taskId,
+          phase: 'observe',
+          message:
+            `Codex gateway circuit is OPEN, skip Codex this round and use Anthropic draft fallback directly.` +
+            `${codexGatewayCircuitOpenReason ? ` reason=${codexGatewayCircuitOpenReason}` : ''}`,
+          retryCount,
+          roundIndex,
+          timestamp: Date.now(),
+        })
+      } else {
+        for (let attempt = 1; attempt <= CODEX_QUERY_MAX_ATTEMPTS; attempt += 1) {
+          try {
+            codexTurn = await thread.run(
+              codexTurnInput,
+              {
+                outputSchema: DRAFT_OUTPUT_SCHEMA,
+                signal,
+              },
+            )
+            break
+          } catch (error: unknown) {
+            const parsed = parseCodexQueryError(error)
+            lastCodexQueryError = parsed
+            const shouldRetry = parsed.retriable && attempt < CODEX_QUERY_MAX_ATTEMPTS
+            const nextBackoffMs = shouldRetry ? CODEX_QUERY_BACKOFF_BASE_MS * 2 ** (attempt - 1) : 0
+            const detailParts = [
+              `attempt=${attempt}/${CODEX_QUERY_MAX_ATTEMPTS}`,
+              `status=${parsed.statusCode ?? 'unknown'}`,
+              `request_id=${parsed.requestId ?? 'unknown'}`,
+              `retriable=${parsed.retriable}`,
+              parsed.url ? `url=${parsed.url}` : null,
+              shouldRetry ? `next_backoff_ms=${nextBackoffMs}` : null,
+            ]
+              .filter((part): part is string => Boolean(part))
+              .join(', ')
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `Codex query attempt failed. ${detailParts}`,
+              retryCount,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+
+            if (!shouldRetry) {
+              break
+            }
+            await sleepWithAbort(nextBackoffMs, signal)
+            if (signal.aborted) {
+              break
+            }
+          }
+        }
+      }
+
+      if (signal.aborted) {
+        pushEvent({
+          taskId,
+          phase: 'failed',
+          message: 'Task aborted by user',
+          retryCount,
+          roundIndex,
+          timestamp: Date.now(),
+        })
+        await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
+        return
+      }
+
+      if (codexTurn) {
+        contextUsage = this.deriveContextUsageFromUsage(codexTurn.usage, model)
         if (contextUsage) {
           latestContextUsagePercentage = contextUsage.percentage
         }
 
-        draftPrompt = parseDraftPrompt(turn.finalResponse)
-        if (!draftPrompt) {
+        draftPrompt = parseDraftPrompt(codexTurn.finalResponse)
+        if (draftPrompt) {
+          draftSource = 'codex'
+        } else {
           resultDiagnostics = {
             failureTypes: ['parse_error'],
             detail: 'codex_response_parse_failed',
@@ -398,12 +623,136 @@ export class CodexSdkAgentEngine implements AgentEngine {
             timestamp: Date.now(),
           })
         }
-      } catch (error: unknown) {
-        activeRoundState.queryError = error instanceof Error ? error.message : String(error)
+      } else if (lastCodexQueryError) {
+        activeRoundState.queryError = lastCodexQueryError.raw
+        if (lastCodexQueryError.statusCode === 401 || lastCodexQueryError.statusCode === 403) {
+          unrecoverableCodexError =
+            `codex_auth_or_permission_error: status=${lastCodexQueryError.statusCode}` +
+            `, request_id=${lastCodexQueryError.requestId ?? 'unknown'}` +
+            `, url=${lastCodexQueryError.url ?? 'unknown'}`
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message:
+              `Codex returned non-retriable auth/permission error.` +
+              ` status=${lastCodexQueryError.statusCode}, request_id=${lastCodexQueryError.requestId ?? 'unknown'}`,
+            retryCount,
+            roundIndex,
+            timestamp: Date.now(),
+          })
+        }
+        if (lastCodexQueryError.isGateway502) {
+          if (CODEX_OPEN_GATEWAY_CIRCUIT_ON_502) {
+            codexGatewayCircuitOpen = true
+            codexGatewayCircuitOpenReason =
+              `status=502,request_id=${lastCodexQueryError.requestId ?? 'unknown'},url=${lastCodexQueryError.url ?? 'unknown'}`
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message:
+                `Codex gateway circuit opened after repeated 502.` +
+                ` Remaining rounds will bypass Codex and use Anthropic draft fallback.`,
+              retryCount,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+          }
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message:
+              `Codex 502 detected, switching to Anthropic draft fallback.` +
+              ` request_id=${lastCodexQueryError.requestId ?? 'unknown'}`,
+            retryCount,
+            roundIndex,
+            timestamp: Date.now(),
+          })
+
+          const anthropicDraft = await this.generateAnthropicDraftPrompt({
+            apiKey: options.anthropicApiKey,
+            baseUrl: options.anthropicBaseUrl,
+            model: options.anthropicModel ?? DEFAULT_ANTHROPIC_MODEL,
+            prompt: `${baseSystemPrompt}\n\n${roundInstruction}`,
+          })
+          if (anthropicDraft.draftPrompt) {
+            draftPrompt = anthropicDraft.draftPrompt
+            draftSource = 'anthropic'
+            activeRoundState.queryError = null
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `Anthropic draft fallback succeeded. source=anthropic`,
+              retryCount,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+          } else {
+            activeRoundState.queryError = null
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message:
+                `Anthropic draft fallback failed (${anthropicDraft.error ?? 'unknown_error'}),` +
+                ' using fallback template prompt.',
+              retryCount,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+          }
+        }
+      } else if (codexGatewayCircuitOpen) {
+        const anthropicDraft = await this.generateAnthropicDraftPrompt({
+          apiKey: options.anthropicApiKey,
+          baseUrl: options.anthropicBaseUrl,
+          model: options.anthropicModel ?? DEFAULT_ANTHROPIC_MODEL,
+          prompt: `${baseSystemPrompt}\n\n${roundInstruction}`,
+        })
+        if (anthropicDraft.draftPrompt) {
+          draftPrompt = anthropicDraft.draftPrompt
+          draftSource = 'anthropic'
+          activeRoundState.queryError = null
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message: `Anthropic draft fallback succeeded. source=anthropic`,
+            retryCount,
+            roundIndex,
+            timestamp: Date.now(),
+          })
+        } else {
+          activeRoundState.queryError = null
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message:
+              `Anthropic draft fallback failed (${anthropicDraft.error ?? 'unknown_error'}),` +
+              ' using fallback template prompt.',
+            retryCount,
+            roundIndex,
+            timestamp: Date.now(),
+          })
+        }
       }
 
-      const draftForGeneration =
-        draftPrompt ?? buildFallbackDraftPrompt(input.productName, input.context)
+      if (unrecoverableCodexError) {
+        terminalFailureReason = unrecoverableCodexError
+        break
+      }
+
+      const draftForGeneration = draftPrompt ?? buildFallbackDraftPrompt(input.productName, input.context)
+      if (!draftPrompt) {
+        draftSource = 'fallback_template'
+      }
+
+      pushEvent({
+        taskId,
+        phase: 'observe',
+        message: `draft prompt selected. source=${draftSource}, summary=${summarizeDraftPromptForLog(draftForGeneration)}`,
+        retryCount,
+        roundIndex,
+        contextUsage,
+        timestamp: Date.now(),
+      })
 
       if (!activeRoundState.queryError) {
         const enforcedPrompt = buildEnforcedGenerationPrompt({
@@ -823,6 +1172,47 @@ export class CodexSdkAgentEngine implements AgentEngine {
       contextThumbPath,
       roundEvalScore,
       roundDefect,
+    }
+  }
+
+  private async generateAnthropicDraftPrompt(params: {
+    apiKey: string
+    baseUrl?: string
+    model: string
+    prompt: string
+  }): Promise<{ draftPrompt: string | null; error: string | null }> {
+    try {
+      const anthropic = new Anthropic({
+        apiKey: params.apiKey,
+        ...(params.baseUrl ? { baseURL: params.baseUrl } : {}),
+      })
+
+      const response = await anthropic.messages.create({
+        model: params.model,
+        max_tokens: 1_200,
+        temperature: 0,
+        messages: [{ role: 'user', content: params.prompt }],
+      })
+
+      const rawText = extractAnthropicText(
+        response.content as ReadonlyArray<{ type: string; text?: string }>,
+      )
+      if (!rawText) {
+        return {
+          draftPrompt: null,
+          error: 'anthropic_empty_text',
+        }
+      }
+      const parsedDraft = parseDraftPrompt(rawText)
+      return {
+        draftPrompt: parsedDraft,
+        error: parsedDraft ? null : 'anthropic_parse_failed',
+      }
+    } catch (error: unknown) {
+      return {
+        draftPrompt: null,
+        error: error instanceof Error ? error.message : String(error),
+      }
     }
   }
 

@@ -513,6 +513,15 @@ export function Settings() {
     }
   }, [anthropicInput, anthropicBaseUrl, anthropicModel])
 
+  const buildCodexTroubleshootingHint = useCallback((raw: string): string => {
+    const commonHint =
+      '建议：检查代理网关可用性、确认模型可用；如在使用自定义 Base URL，可先清空该项并用官方地址重试。'
+    if (/status\s*502|bad gateway|upstream request failed/i.test(raw)) {
+      return `${raw} ${commonHint}`
+    }
+    return `${raw} 建议：确认 API Key/Base URL/模型配置后重试。`
+  }, [])
+
   const handleTestCodexConnection = useCallback(async () => {
     if (!codexInput.trim()) {
       const nextMessage = { type: 'error' as const, text: '请先输入 Codex API Key 后再测试。' }
@@ -534,19 +543,22 @@ export function Settings() {
         type: result.success ? 'success' : 'error',
         text: result.success
           ? `Codex 连接测试成功（模型：${codexModel.trim() || DEFAULT_CODEX_MODEL}）`
-          : `Codex 连接测试失败：${result.message}`,
+          : `Codex 连接测试失败：${buildCodexTroubleshootingHint(result.message)}`,
       } as const
       setCodexTestMessage(nextMessage)
       setMessage(nextMessage)
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error)
-      const nextMessage = { type: 'error' as const, text: `Codex 连接测试失败：${text}` }
+      const nextMessage = {
+        type: 'error' as const,
+        text: `Codex 连接测试失败：${buildCodexTroubleshootingHint(text)}`,
+      }
       setCodexTestMessage(nextMessage)
       setMessage(nextMessage)
     } finally {
       setTestingCodex(false)
     }
-  }, [codexInput, codexBaseUrl, codexModel])
+  }, [buildCodexTroubleshootingHint, codexInput, codexBaseUrl, codexModel])
 
   const handleTestImageProviderConnection = useCallback(
     async (provider: ImageProviderName) => {

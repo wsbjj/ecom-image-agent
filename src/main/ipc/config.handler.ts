@@ -51,6 +51,27 @@ async function getOptionalDecryptedValue(key: string): Promise<string | undefine
   return text.length > 0 ? text : undefined
 }
 
+function parseCodexErrorDiagnostics(rawMessage: string): {
+  statusCode: number | null
+  requestId: string | null
+  url: string | null
+} {
+  const statusMatch =
+    rawMessage.match(/\bstatus\s+(\d{3})\b/i) ??
+    rawMessage.match(/\bstatus=(\d{3})\b/i) ??
+    rawMessage.match(/\bhttp\s+(\d{3})\b/i)
+  const requestIdMatch =
+    rawMessage.match(/\brequest id:\s*([a-z0-9-]+)/i) ??
+    rawMessage.match(/\brequest_id=([a-z0-9-]+)/i)
+  const urlMatch = rawMessage.match(/\burl:\s*([^,\s]+)/i) ?? rawMessage.match(/\burl=([^,\s]+)/i)
+
+  return {
+    statusCode: statusMatch?.[1] ? Number.parseInt(statusMatch[1], 10) : null,
+    requestId: requestIdMatch?.[1] ?? null,
+    url: urlMatch?.[1] ?? null,
+  }
+}
+
 function guessMimeType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase()
   switch (ext) {
@@ -283,7 +304,18 @@ export function registerConfigHandlers(): void {
         return { success: true, message: `Codex connection test succeeded (model: ${model})` }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        return { success: false, message }
+        const diagnostics = parseCodexErrorDiagnostics(message)
+        const diagText = [
+          diagnostics.statusCode !== null ? `status=${diagnostics.statusCode}` : null,
+          diagnostics.requestId ? `request_id=${diagnostics.requestId}` : null,
+          diagnostics.url ? `url=${diagnostics.url}` : null,
+        ]
+          .filter((item): item is string => Boolean(item))
+          .join(', ')
+        const hint =
+          'Hint: check proxy gateway/model availability, or clear Codex Base URL and retry with official endpoint.'
+        const formattedMessage = diagText.length > 0 ? `${message}; ${diagText}. ${hint}` : `${message}. ${hint}`
+        return { success: false, message: formattedMessage }
       }
     },
   )

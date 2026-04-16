@@ -97,6 +97,33 @@ def _extract_json_block(raw_text: str) -> dict[str, Any]:
     return json.loads(raw_text[start:end])
 
 
+def _extract_text_from_message_content(message: Any) -> str:
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        raise ValueError("model content is invalid")
+
+    text_parts: list[str] = []
+    block_types: list[str] = []
+    for block in content:
+        block_type = getattr(block, "type", None)
+        if block_type is None and isinstance(block, dict):
+            block_type = block.get("type")
+        block_types.append(str(block_type) if block_type else type(block).__name__)
+
+        text_value = getattr(block, "text", None)
+        if text_value is None and isinstance(block, dict):
+            text_value = block.get("text")
+        if isinstance(text_value, str):
+            trimmed = text_value.strip()
+            if trimmed:
+                text_parts.append(trimmed)
+
+    if not text_parts:
+        raise ValueError("model returned no text block, block_types=" + ",".join(block_types))
+
+    return "\n".join(text_parts)
+
+
 def _normalize_dimensions(
     raw_dimensions: list[dict[str, Any]],
     rubric_dimensions: list[RubricDimension],
@@ -202,7 +229,7 @@ def evaluate_image(
         ],
     )
 
-    raw_text = message.content[0].text.strip()
+    raw_text = _extract_text_from_message_content(message)
     raw_json = _extract_json_block(raw_text)
 
     raw_dimensions = raw_json.get("dimensions", [])

@@ -370,4 +370,27 @@ describe('registerConfigHandlers config:test-codex', () => {
     expect(result.success).toBe(false)
     expect(result.message).toMatch(/codex unavailable/i)
   })
+
+  it('returns parsed diagnostics and hint for codex upstream errors', async () => {
+    mockCodexThreadRun.mockRejectedValue(
+      new Error(
+        'unexpected status 502 Bad Gateway: Upstream request failed, url: https://agent.cam01.cn/v1/responses, request id: req-502-test',
+      ),
+    )
+
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_TEST_CODEX)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, { apiKey: 'codex-key' })) as {
+      success: boolean
+      message: string
+    }
+
+    expect(result.success).toBe(false)
+    expect(result.message).toMatch(/status=502/i)
+    expect(result.message).toMatch(/request_id=req-502-test/i)
+    expect(result.message).toMatch(/agent\.cam01\.cn\/v1\/responses/i)
+    expect(result.message).toMatch(/official endpoint/i)
+  })
 })
