@@ -49,7 +49,7 @@ export interface ImageAsset {
 }
 
 export type ImageProviderName = 'gemini' | 'seedream'
-export type AgentEngineName = 'claude_sdk' | 'legacy'
+export type AgentEngineName = 'claude_sdk' | 'codex_sdk' | 'legacy'
 
 export interface TaskInput {
   skuId: string
@@ -151,6 +151,16 @@ export interface EvaluationTemplateRecord {
 export interface EvaluationTemplateInput {
   name: string
   version: number
+  defaultThreshold: number
+  rubricMarkdown: string
+}
+
+export interface EvalTemplateDraftRequest {
+  requirements: string
+}
+
+export interface EvalTemplateDraftResponse {
+  name: string
   defaultThreshold: number
   rubricMarkdown: string
 }

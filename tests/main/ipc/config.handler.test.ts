@@ -12,6 +12,9 @@ const {
   mockListEvaluationTemplates,
   mockDeleteEvaluationTemplate,
   mockEnsureDefaultEvaluationTemplate,
+  mockAnthropicMessagesCreate,
+  mockCodexStartThread,
+  mockCodexThreadRun,
 } = vi.hoisted(() => ({
   handlerMap: new Map<string, (...args: unknown[]) => Promise<unknown>>(),
   mockInsertEvaluationTemplate: vi.fn(),
@@ -23,6 +26,9 @@ const {
   mockListEvaluationTemplates: vi.fn(),
   mockDeleteEvaluationTemplate: vi.fn(),
   mockEnsureDefaultEvaluationTemplate: vi.fn(),
+  mockAnthropicMessagesCreate: vi.fn(),
+  mockCodexStartThread: vi.fn(),
+  mockCodexThreadRun: vi.fn(),
 }))
 
 vi.mock('electron', () => ({
@@ -36,12 +42,22 @@ vi.mock('electron', () => ({
   },
   safeStorage: {
     encryptString: vi.fn((value: string) => Buffer.from(value, 'utf8')),
-    decryptString: vi.fn(() => ''),
+    decryptString: vi.fn((value: Buffer) => Buffer.from(value).toString('utf8')),
   },
 }))
 
 vi.mock('@anthropic-ai/sdk', () => ({
-  default: vi.fn(),
+  default: vi.fn(() => ({
+    messages: {
+      create: mockAnthropicMessagesCreate,
+    },
+  })),
+}))
+
+vi.mock('@openai/codex-sdk', () => ({
+  Codex: vi.fn(() => ({
+    startThread: mockCodexStartThread,
+  })),
 }))
 
 vi.mock('@google/generative-ai', () => ({
@@ -82,11 +98,17 @@ const VALID_MARKDOWN = `
 保持写实一致性，给出可执行修正建议。
 `.trim()
 
+function encodeStoredValue(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64')
+}
+
 describe('registerConfigHandlers eval-template:save', () => {
   beforeEach(() => {
     handlerMap.clear()
     vi.clearAllMocks()
     mockInsertEvaluationTemplate.mockResolvedValue(undefined)
+    mockAnthropicMessagesCreate.mockReset()
+    mockGetConfigValue.mockResolvedValue(undefined)
   })
 
   it('parses markdown rubric and stores normalized JSON payload', async () => {
@@ -140,5 +162,212 @@ describe('registerConfigHandlers eval-template:save', () => {
         },
       ),
     ).rejects.toThrow(/评分维度/)
+  })
+})
+
+describe('registerConfigHandlers eval-template:generate-draft', () => {
+  beforeEach(() => {
+    handlerMap.clear()
+    vi.clearAllMocks()
+    mockAnthropicMessagesCreate.mockReset()
+    mockGetConfigValue.mockResolvedValue(undefined)
+  })
+
+  it('returns normalized draft from anthropic response without writing db', async () => {
+    mockGetConfigValue.mockImplementation(async (key: string) => {
+      if (key === 'ANTHROPIC_API_KEY') return encodeStoredValue('sk-ant-test')
+      if (key === 'ANTHROPIC_MODEL') return encodeStoredValue('claude-sonnet-4-test')
+      return undefined
+    })
+    mockAnthropicMessagesCreate.mockResolvedValue({
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            name: ' 女装主图评估模板 ',
+            defaultThreshold: '101',
+            rubricMarkdown: VALID_MARKDOWN,
+          }),
+        },
+      ],
+    })
+
+    registerConfigHandlers()
+    const generateHandler = handlerMap.get(IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_DRAFT)
+    expect(generateHandler).toBeTruthy()
+
+    const result = (await generateHandler!({}, {
+      requirements: '女装主图，强调材质写实与文字正确',
+    })) as {
+      name: string
+      defaultThreshold: number
+      rubricMarkdown: string
+    }
+
+    expect(mockAnthropicMessagesCreate).toHaveBeenCalledTimes(1)
+    expect(result.name).toBe('女装主图评估模板')
+    expect(result.defaultThreshold).toBe(100)
+    expect(result.rubricMarkdown).toContain('## 评分维度')
+    expect(result.rubricMarkdown).toContain('## 评分说明')
+    expect(mockInsertEvaluationTemplate).not.toHaveBeenCalled()
+  })
+
+  it('throws clear error when anthropic api key is missing', async () => {
+    registerConfigHandlers()
+    const generateHandler = handlerMap.get(IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_DRAFT)
+    expect(generateHandler).toBeTruthy()
+
+    await expect(
+      generateHandler!({}, { requirements: '生成评估模板' }),
+    ).rejects.toThrow(/Anthropic API Key/)
+    expect(mockAnthropicMessagesCreate).not.toHaveBeenCalled()
+  })
+
+  it('retries once when first draft is invalid and succeeds on second attempt', async () => {
+    mockGetConfigValue.mockImplementation(async (key: string) => {
+      if (key === 'ANTHROPIC_API_KEY') return encodeStoredValue('sk-ant-test')
+      return undefined
+    })
+    mockAnthropicMessagesCreate
+      .mockResolvedValueOnce({
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              name: '坏草稿',
+              defaultThreshold: 85,
+              rubricMarkdown: '## 评分说明\n\n只有说明没有维度',
+            }),
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              name: '修复后草稿',
+              defaultThreshold: 90,
+              rubricMarkdown: VALID_MARKDOWN,
+            }),
+          },
+        ],
+      })
+
+    registerConfigHandlers()
+    const generateHandler = handlerMap.get(IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_DRAFT)
+    expect(generateHandler).toBeTruthy()
+
+    const result = (await generateHandler!({}, {
+      requirements: '修复重试场景',
+    })) as {
+      name: string
+      defaultThreshold: number
+      rubricMarkdown: string
+    }
+
+    expect(mockAnthropicMessagesCreate).toHaveBeenCalledTimes(2)
+    expect(result.name).toBe('修复后草稿')
+    expect(result.defaultThreshold).toBe(90)
+    expect(result.rubricMarkdown).toContain('edge_distortion')
+  })
+
+  it('throws clear error when both attempts fail validation', async () => {
+    mockGetConfigValue.mockImplementation(async (key: string) => {
+      if (key === 'ANTHROPIC_API_KEY') return encodeStoredValue('sk-ant-test')
+      return undefined
+    })
+    mockAnthropicMessagesCreate.mockResolvedValue({
+      content: [
+        {
+          type: 'text',
+          text: '{"name":"坏草稿","defaultThreshold":85,"rubricMarkdown":"无效内容"}',
+        },
+      ],
+    })
+
+    registerConfigHandlers()
+    const generateHandler = handlerMap.get(IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_DRAFT)
+    expect(generateHandler).toBeTruthy()
+
+    await expect(
+      generateHandler!({}, { requirements: '两次失败场景' }),
+    ).rejects.toThrow(/AI 生成模板失败/)
+    expect(mockAnthropicMessagesCreate).toHaveBeenCalledTimes(2)
+    expect(mockInsertEvaluationTemplate).not.toHaveBeenCalled()
+  })
+})
+
+describe('registerConfigHandlers config:test-codex', () => {
+  beforeEach(() => {
+    handlerMap.clear()
+    vi.clearAllMocks()
+    mockGetConfigValue.mockResolvedValue(undefined)
+    mockCodexThreadRun.mockReset()
+    mockCodexStartThread.mockReset()
+    mockCodexStartThread.mockReturnValue({
+      run: mockCodexThreadRun,
+    })
+  })
+
+  it('returns clear error when codex api key is missing', async () => {
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_TEST_CODEX)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {})) as {
+      success: boolean
+      message: string
+    }
+    expect(result.success).toBe(false)
+    expect(result.message).toMatch(/Codex API Key/i)
+    expect(mockCodexThreadRun).not.toHaveBeenCalled()
+  })
+
+  it('tests codex connection with explicit params', async () => {
+    mockCodexThreadRun.mockResolvedValue({
+      items: [],
+      finalResponse: '{"draft_prompt":"ok"}',
+      usage: null,
+    })
+
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_TEST_CODEX)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {
+      apiKey: 'codex-key',
+      baseUrl: 'https://proxy.example.com/v1',
+      model: 'gpt-5.4',
+    })) as {
+      success: boolean
+      message: string
+    }
+
+    expect(mockCodexStartThread).toHaveBeenCalledWith({
+      model: 'gpt-5.4',
+      sandboxMode: 'read-only',
+      approvalPolicy: 'never',
+      skipGitRepoCheck: true,
+    })
+    expect(mockCodexThreadRun).toHaveBeenCalledWith('ping')
+    expect(result.success).toBe(true)
+    expect(result.message).toMatch(/succeeded/i)
+  })
+
+  it('returns failure message when codex thread run throws', async () => {
+    mockCodexThreadRun.mockRejectedValue(new Error('codex unavailable'))
+
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_TEST_CODEX)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, { apiKey: 'codex-key' })) as {
+      success: boolean
+      message: string
+    }
+
+    expect(result.success).toBe(false)
+    expect(result.message).toMatch(/codex unavailable/i)
   })
 })

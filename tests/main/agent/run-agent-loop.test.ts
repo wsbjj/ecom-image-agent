@@ -72,6 +72,7 @@ function createInput(taskId = 'task-legacy-1') {
     context: 'warm studio lighting',
     templateId: 1,
     productImages: [{ path: '/images/p1.png' }],
+    userPrompt: 'Keep amber glass color and label details unchanged.',
   }
 }
 
@@ -208,6 +209,7 @@ describe('runAgentLoop', () => {
       1,
       'generate_image',
       expect.objectContaining({
+        prompt: expect.stringContaining('Keep amber glass color and label details unchanged.'),
         product_image_paths: ['/images/p1.png'],
         product_name: 'Liquid Bottle',
         context: 'warm studio lighting',

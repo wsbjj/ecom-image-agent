@@ -91,6 +91,7 @@ function createInput(taskId = 'task-claude-1'): TaskInput {
     context: 'warm studio lighting',
     templateId: 1,
     productImages: [{ path: '/images/p1.png' }],
+    userPrompt: 'Keep the bottle label and amber liquid exactly consistent.',
   }
 }
 
@@ -159,17 +160,80 @@ function createSdkResultMessage(params?: {
   }
 }
 
-function createMockQueryResult(resultMessage: unknown) {
+function createMockStreamingQuery(resultMessage: unknown) {
+  const queue: unknown[] = []
+  let pendingResolver: ((value: IteratorResult<unknown>) => void) | null = null
+  let closed = false
+
+  const emit = (message: unknown): void => {
+    if (closed) return
+    if (pendingResolver) {
+      pendingResolver({ done: false, value: message })
+      pendingResolver = null
+      return
+    }
+    queue.push(message)
+  }
+
+  const close = (): void => {
+    closed = true
+    if (pendingResolver) {
+      pendingResolver({ done: true, value: undefined })
+      pendingResolver = null
+    }
+  }
+
   return {
     async *[Symbol.asyncIterator]() {
-      yield resultMessage
+      while (true) {
+        if (queue.length > 0) {
+          yield queue.shift()
+          continue
+        }
+        if (closed) break
+        const next = await new Promise<IteratorResult<unknown>>((resolve) => {
+          pendingResolver = resolve
+        })
+        if (next.done) break
+        yield next.value
+      }
     },
+    initializationResult: vi.fn(async () => ({
+      commands: [],
+      agents: [],
+      output_style: 'default',
+      available_output_styles: ['default'],
+      models: [{ id: 'claude-sonnet-4-20250514', displayName: 'Claude Sonnet' }],
+      account: {},
+    })),
+    mcpServerStatus: vi.fn(async () => [{ name: 'sdk-local', status: 'connected' }]),
+    streamInput: vi.fn(async (stream: AsyncIterable<unknown>) => {
+      for await (const _ of stream) {
+        break
+      }
+      emit(resultMessage)
+    }),
     getContextUsage: vi.fn(async () => ({
       totalTokens: 100,
       maxTokens: 200,
       percentage: 50,
     })),
-    close: vi.fn(),
+    interrupt: vi.fn(async () => undefined),
+    close: vi.fn(() => {
+      close()
+    }),
+    _emitFromInitialPrompt: (prompt: string | AsyncIterable<unknown>) => {
+      if (typeof prompt === 'string') {
+        emit(resultMessage)
+        return
+      }
+      void (async () => {
+        for await (const _ of prompt) {
+          emit(resultMessage)
+          break
+        }
+      })()
+    },
   }
 }
 
@@ -198,8 +262,31 @@ describe('ClaudeSdkAgentEngine', () => {
     mockTool.mockImplementation((name: string) => ({ name }))
   })
 
-  it('retries instead of failing immediately and uses aligned mcp tool names', async () => {
-    mockQuery.mockImplementation(() => createMockQueryResult(createSdkResultMessage()))
+  it('uses single query + streamInput for retries and applies project-isolated settings', async () => {
+    const permissionResults: unknown[] = []
+    mockQuery.mockImplementation((params: { prompt: string | AsyncIterable<unknown>; options: Record<string, unknown> }) => {
+      const q = createMockStreamingQuery(createSdkResultMessage())
+      q._emitFromInitialPrompt(params.prompt)
+
+      const allowedTools = params.options.allowedTools as string[]
+      const canUseTool = params.options.canUseTool as
+        | ((toolName: string, toolInput: Record<string, unknown>) => Promise<unknown>)
+        | undefined
+
+      if (canUseTool && Array.isArray(allowedTools)) {
+        const generateTool = allowedTools.find((item) => item.endsWith('__generate_image')) ?? ''
+        const evaluateTool = allowedTools.find((item) => item.endsWith('__evaluate_image')) ?? ''
+        if (generateTool) {
+          void canUseTool(generateTool, { prompt: 'draft prompt' }).then((res) => permissionResults.push(res))
+        }
+        if (evaluateTool) {
+          void canUseTool(evaluateTool, {}).then((res) => permissionResults.push(res))
+        }
+        void canUseTool('unknown_tool', {}).then((res) => permissionResults.push(res))
+      }
+
+      return q
+    })
 
     const callTool = vi.fn(async () => {
       throw new Error('fallback generate failed')
@@ -220,17 +307,43 @@ describe('ClaudeSdkAgentEngine', () => {
       createOptions(1),
     )
 
-    expect(mockQuery).toHaveBeenCalledTimes(2)
-
+    expect(mockQuery).toHaveBeenCalledTimes(1)
     const firstQueryArgs = mockQuery.mock.calls[0][0] as {
-      options: { mcpServers: Record<string, unknown>; allowedTools: string[] }
+      options: {
+        mcpServers: Record<string, unknown>
+        allowedTools: string[]
+        settingSources: string[]
+        persistSession: boolean
+        cwd: string
+      }
     }
-    const firstServerName = Object.keys(firstQueryArgs.options.mcpServers)[0]
-    expect(firstServerName).toBe('ecom-mcp-task-claude-retry-0')
+    const serverName = Object.keys(firstQueryArgs.options.mcpServers)[0]
+    expect(serverName).toBe('ecom-mcp-task-claude-retry')
     expect(firstQueryArgs.options.allowedTools).toEqual([
-      'mcp__ecom-mcp-task-claude-retry-0__generate_image',
-      'mcp__ecom-mcp-task-claude-retry-0__evaluate_image',
+      'mcp__ecom-mcp-task-claude-retry__generate_image',
+      'mcp__ecom-mcp-task-claude-retry__evaluate_image',
     ])
+    expect(firstQueryArgs.options.settingSources).toEqual(['project'])
+    expect(firstQueryArgs.options.persistSession).toBe(true)
+    const normalizedCwd = firstQueryArgs.options.cwd.replace(/\\/g, '/')
+    expect(normalizedCwd).toContain('/tmp/ecom-image-agent/claude_sdk_task_projects/task-claude-retry')
+
+    const q = mockQuery.mock.results[0].value as { streamInput: ReturnType<typeof vi.fn> }
+    expect(q.streamInput).toHaveBeenCalledTimes(1)
+
+    const permissionAllowGenerate = permissionResults.find((item) => {
+      return (
+        typeof item === 'object' &&
+        item !== null &&
+        'behavior' in item &&
+        (item as { behavior: string }).behavior === 'allow' &&
+        'updatedInput' in item
+      )
+    }) as { behavior: string; updatedInput?: Record<string, unknown> } | undefined
+
+    expect(permissionAllowGenerate?.updatedInput?.prompt).toContain('Liquid Bottle')
+    expect(permissionAllowGenerate?.updatedInput?.prompt).toContain('Keep the bottle label')
+    expect(permissionResults.some((item) => (item as { behavior?: string })?.behavior === 'deny')).toBe(true)
 
     const payloads = events.map((item) => item.payload as { phase: string; message: string })
     const thoughtCount = payloads.filter((item) => item.phase === 'thought').length
@@ -242,15 +355,17 @@ describe('ClaudeSdkAgentEngine', () => {
   })
 
   it('logs diagnostics and succeeds through last-round fallback', async () => {
-    mockQuery.mockImplementation(() =>
-      createMockQueryResult(
+    mockQuery.mockImplementation((params: { prompt: string | AsyncIterable<unknown> }) => {
+      const q = createMockStreamingQuery(
         createSdkResultMessage({
           permissionDenials: [{ tool_name: 'mcp__deny__x', tool_use_id: '1', tool_input: {} }],
           numTurns: 8,
           terminalReason: 'max_turns',
         }),
-      ),
-    )
+      )
+      q._emitFromInitialPrompt(params.prompt)
+      return q
+    })
 
     const callTool = vi.fn(async (name: string) => {
       if (name === 'generate_image') {
@@ -285,6 +400,10 @@ describe('ClaudeSdkAgentEngine', () => {
       controller.signal,
       createOptions(0),
     )
+
+    expect(mockQuery).toHaveBeenCalledTimes(1)
+    const q = mockQuery.mock.results[0].value as { streamInput: ReturnType<typeof vi.fn> }
+    expect(q.streamInput).not.toHaveBeenCalled()
 
     expect(callTool).toHaveBeenNthCalledWith(
       1,

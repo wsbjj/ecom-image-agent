@@ -8,6 +8,7 @@ export const IPC_CHANNELS = {
   CONFIG_GET_VALUE: 'config:get-value',
   CONFIG_SET: 'config:set',
   CONFIG_TEST_ANTHROPIC: 'config:test-anthropic',
+  CONFIG_TEST_CODEX: 'config:test-codex',
   CONFIG_TEST_IMAGE_PROVIDER: 'config:test-image-provider',
   APP_USER_DATA_PATH: 'app:user-data-path',
   FILE_READ_AS_DATA_URL: 'file:read-as-data-url',
@@ -17,6 +18,7 @@ export const IPC_CHANNELS = {
   EVAL_TEMPLATE_SAVE: 'eval-template:save',
   EVAL_TEMPLATE_LIST: 'eval-template:list',
   EVAL_TEMPLATE_DELETE: 'eval-template:delete',
+  EVAL_TEMPLATE_GENERATE_DRAFT: 'eval-template:generate-draft',
   EVAL_TEMPLATE_GENERATE_STANDARD: 'eval-template:generate-standard',
 } as const satisfies Record<string, string>
 

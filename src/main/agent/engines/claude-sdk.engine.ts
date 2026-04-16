@@ -1,5 +1,13 @@
 import { app, type BrowserWindow } from 'electron'
-import { createSdkMcpServer, query, tool, type SDKMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk'
+import {
+  createSdkMcpServer,
+  query,
+  tool,
+  type Query as SDKQuery,
+  type SDKMessage,
+  type SDKResultMessage,
+  type SDKUserMessage,
+} from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -14,9 +22,9 @@ import {
   updateTaskRoundArtifactScore,
   updateTaskSuccess,
 } from '../../db/queries'
-import { RoundMemoryLedger } from '../round-memory-ledger'
 import { persistRoundArtifacts, pruneRoundOriginalCache } from '../round-image-cache'
 import type { AgentEngine, EngineRuntimeOptions } from './types'
+import { buildEnforcedGenerationPrompt, buildFallbackDraftPrompt } from '../enforced-generation-prompt'
 
 const DEFAULT_MODEL = 'claude-sonnet-4-20250514'
 const DEFAULT_MAX_ORIGINAL_ROUNDS = 12
@@ -43,6 +51,25 @@ interface RoundFailureDiagnosticsInput {
   resultDiagnostics: ResultDiagnostics | null
 }
 
+interface ActiveRoundState {
+  roundIndex: number
+  retryCount: number
+  generatedImagePath: string | null
+  previewImagePath: string | null
+  contextThumbPath: string | null
+  roundEvalScore: number | null
+  roundDefect: DefectAnalysis | null
+  resultMessage: SDKResultMessage | null
+  queryError: string | null
+}
+
+interface CompressionThresholds {
+  soft: number
+  hard: number
+  critical: number
+}
+
+type CompressionMode = 'none' | 'soft' | 'hard' | 'critical'
 type PushEventFn = (event: LoopEvent) => void
 
 function normalizeFailureTypes(types: Iterable<RoundFailureType>): RoundFailureType[] {
@@ -83,24 +110,99 @@ function buildRoundFailureDiagnostics(input: RoundFailureDiagnosticsInput): {
   }
 }
 
-function buildFinalFallbackPrompt(input: TaskInput, lastDefectAnalysis: DefectAnalysis | null): string {
-  const defectHint =
-    lastDefectAnalysis && Array.isArray(lastDefectAnalysis.dimensions)
-      ? lastDefectAnalysis.dimensions
-          .flatMap((dimension) => dimension.issues.slice(0, 1))
-          .filter((issue) => issue.trim().length > 0)
-          .slice(0, 3)
-          .join('; ')
-      : ''
-
-  return defectHint
-    ? `Generate a realistic e-commerce image for ${input.productName} in ${input.context}. Fix previous issues: ${defectHint}.`
-    : `Generate a realistic e-commerce image for ${input.productName} in ${input.context}.`
-}
-
 function buildAttemptSummary(roundsAttempted: number, maxRetries: number): string {
   const maxRounds = maxRetries + 1
   return `${roundsAttempted}/${maxRounds}`
+}
+
+function createUserMessageStream(message: string): AsyncIterable<SDKUserMessage> {
+  return (async function* (): AsyncGenerator<SDKUserMessage> {
+    yield {
+      type: 'user',
+      message: {
+        role: 'user',
+        content: message,
+      },
+      parent_tool_use_id: null,
+    }
+  })()
+}
+
+function normalizeIssueList(defectAnalysis?: DefectAnalysis | null, limit = 4): string[] {
+  if (!defectAnalysis || !Array.isArray(defectAnalysis.dimensions)) {
+    return []
+  }
+  return defectAnalysis.dimensions
+    .flatMap((dimension) => dimension.issues.slice(0, 2))
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .slice(0, limit)
+}
+
+function createActiveRoundState(roundIndex: number, retryCount: number): ActiveRoundState {
+  return {
+    roundIndex,
+    retryCount,
+    generatedImagePath: null,
+    previewImagePath: null,
+    contextThumbPath: null,
+    roundEvalScore: null,
+    roundDefect: null,
+    resultMessage: null,
+    queryError: null,
+  }
+}
+
+function normalizeImagePaths(paths: string[]): string[] {
+  return paths
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+}
+
+function pickCompressionMode(usagePercentage: number, thresholds: CompressionThresholds): CompressionMode {
+  if (usagePercentage >= thresholds.critical) return 'critical'
+  if (usagePercentage >= thresholds.hard) return 'hard'
+  if (usagePercentage >= thresholds.soft) return 'soft'
+  return 'none'
+}
+
+function buildRoundUserInstruction(params: {
+  input: TaskInput
+  roundIndex: number
+  scoreThreshold: number
+  defectAnalysis: DefectAnalysis | null
+  productImageCount: number
+  compressionMode: CompressionMode
+}): string {
+  const issueHints = normalizeIssueList(params.defectAnalysis)
+  const recommendation = params.defectAnalysis?.overall_recommendation?.trim() ?? ''
+  const issueBlock =
+    params.roundIndex > 0 && issueHints.length > 0
+      ? `\nFocus fixes from previous round:\n- ${issueHints.join('\n- ')}${recommendation ? `\n- Overall recommendation: ${recommendation}` : ''}`
+      : ''
+
+  const compressionHint =
+    params.compressionMode === 'critical'
+      ? '\nContext pressure is CRITICAL. Keep reasoning extremely concise, avoid history recap, and call tools immediately.'
+      : params.compressionMode === 'hard'
+        ? '\nContext pressure is HIGH. Keep response concise and avoid restating prior rounds.'
+        : params.compressionMode === 'soft'
+          ? '\nContext usage is rising. Keep this round concise.'
+          : ''
+
+  const productImageHint =
+    params.productImageCount > 0
+      ? `\nUse ${params.productImageCount} product images when calling generate_image.`
+      : ''
+
+  return (
+    `Round ${params.roundIndex + 1}: generate an e-commerce image for product=${params.input.productName}, scene=${params.input.context}, sku=${params.input.skuId}.` +
+    productImageHint +
+    issueBlock +
+    compressionHint +
+    `\nTarget pass threshold is ${params.scoreThreshold}.` +
+    '\nYou must call generate_image first, then call evaluate_image. Do not end at text output only.'
+  )
 }
 
 export class ClaudeSdkAgentEngine implements AgentEngine {
@@ -119,6 +221,9 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
     await fs.mkdir(readyDir, { recursive: true })
     await fs.mkdir(failedDir, { recursive: true })
 
+    const isolatedProjectDir = path.join(app.getPath('userData'), 'claude_sdk_task_projects', taskId)
+    await fs.mkdir(path.join(isolatedProjectDir, '.claude'), { recursive: true })
+
     const pushEvent: PushEventFn = (event) => {
       if (!win.isDestroyed()) {
         win.webContents.send(IPC_CHANNELS.AGENT_LOOP_EVENT, event)
@@ -126,27 +231,29 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
     }
 
     const mcpServer = await createMcpServer(vlmBridge, options.provider)
-    const memoryLedger = new RoundMemoryLedger({
-      retentionRatio: options.retentionRatio,
-      thresholds: {
-        soft: options.compressionThresholdSoft,
-        hard: options.compressionThresholdHard,
-        critical: options.compressionThresholdCritical,
-      },
-    })
-
-    const normalizeImagePaths = (paths: string[]): string[] =>
-      paths
-        .map((p) => p.trim())
-        .filter((p) => p.length > 0)
-
     const productImagePaths = normalizeImagePaths(input.productImages.map((img) => img.path))
     const referenceImagePaths = input.referenceImages
       ? normalizeImagePaths(input.referenceImages.map((img) => img.path))
       : undefined
     const productImageAngles = input.productImages
       .map((img) => img.angle)
-      .filter((a): a is string => Boolean(a))
+      .filter((item): item is string => Boolean(item))
+
+    const compressionThresholds: CompressionThresholds = {
+      soft: options.compressionThresholdSoft,
+      hard: options.compressionThresholdHard,
+      critical: options.compressionThresholdCritical,
+    }
+
+    const baseSystemPrompt = buildSystemPrompt({
+      productName: input.productName,
+      context: input.context,
+      retryCount: 0,
+      scoreThreshold: options.scoreThreshold,
+      productImageAngles: productImageAngles.length > 0 ? productImageAngles : undefined,
+      userPrompt: input.userPrompt,
+      rubricDimensions: options.evaluationRubric.dimensions,
+    })
 
     let retryCount = 0
     let roundsAttempted = 0
@@ -154,485 +261,630 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
     let lastImagePath: string | null = null
     let totalCostUsd = 0
     let terminalFailureReason: string | null = null
+    let latestContextUsagePercentage = 0
 
-    while (retryCount <= options.maxRetries) {
-      if (signal.aborted) {
-        pushEvent({
-          taskId,
-          phase: 'failed',
-          message: 'Task aborted by user',
-          retryCount,
-          roundIndex: retryCount,
-          timestamp: Date.now(),
-        })
-        await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
-        return
-      }
+    const retainedRoundIndexes: number[] = []
+    let streamFailureReason: string | null = null
+    let activeRoundState: ActiveRoundState | null = null
+    let queryInstance: SDKQuery | null = null
+    let queryPump: Promise<void> | null = null
+    let queryBootstrapDone = false
+    let pendingRoundResult:
+      | {
+          roundIndex: number
+          resolve: (message: SDKResultMessage) => void
+          reject: (error: Error) => void
+        }
+      | null = null
 
-      const roundIndex = retryCount
-      const isLastRound = roundIndex >= options.maxRetries
-      roundsAttempted = roundIndex + 1
+    const mcpServerName = `ecom-mcp-${taskId}`
+    const allowedTools = [`mcp__${mcpServerName}__generate_image`, `mcp__${mcpServerName}__evaluate_image`]
 
-      const memoryBlock = memoryLedger.buildMemoryPromptBlock()
-      const systemPrompt = buildSystemPrompt({
-        productName: input.productName,
-        context: input.context,
-        defectAnalysis: lastDefectAnalysis ?? undefined,
-        retryCount,
-        scoreThreshold: options.scoreThreshold,
-        productImageAngles: productImageAngles.length > 0 ? productImageAngles : undefined,
-        userPrompt: input.userPrompt,
-        rubricDimensions: options.evaluationRubric.dimensions,
-      })
-      const composedSystemPrompt = memoryBlock
-        ? `${systemPrompt}\n\n## Multi-round memory\n${memoryBlock}`
-        : systemPrompt
-
-      pushEvent({
-        taskId,
-        phase: 'thought',
-        message:
-          `Round ${roundIndex + 1} started with Claude SDK. product=${input.productName}` +
-          `, pass_threshold=${options.scoreThreshold}, max_retries=${options.maxRetries}`,
-        retryCount,
-        roundIndex,
-        timestamp: Date.now(),
-      })
-
-      let generatedImagePath: string | null = null
-      let previewImagePath: string | null = null
-      let contextThumbPath: string | null = null
-      let roundEvalScore: number | null = null
-      let roundDefect: DefectAnalysis | null = null
-      let resultMessage: SDKResultMessage | null = null
-      let queryError: string | null = null
-
-      const mcpServerName = `ecom-mcp-${taskId}-${roundIndex}`
-      const sdkMcpServer = createSdkMcpServer({
-        name: mcpServerName,
-        tools: [
-          tool(
-            'generate_image',
-            'Call image generation API and return local absolute file path',
-            {
-              prompt: z.string(),
-              style: z.string().optional(),
-              aspect_ratio: z.enum(['1:1', '4:3', '16:9']).optional(),
-              product_image_paths: z.array(z.string()).optional(),
-              reference_image_paths: z.array(z.string()).optional(),
-            },
-            async (args) => {
-              pushEvent({
-                taskId,
-                phase: 'act',
-                message: `generate_image args=${JSON.stringify(args)}`,
-                retryCount,
-                roundIndex,
-                timestamp: Date.now(),
-              })
-
-              const result = (await mcpServer.callTool('generate_image', {
-                ...args,
-                product_image_paths: productImagePaths,
-                ...(referenceImagePaths?.length ? { reference_image_paths: referenceImagePaths } : {}),
-                product_name: input.productName,
-                context: input.context,
-                rubric: options.evaluationRubric,
-                pass_threshold: options.scoreThreshold,
-              })) as {
-                image_path: string
-                prompt_used: string
-              }
-
-              const artifacts = await persistRoundArtifacts({
-                taskId,
-                roundIndex,
-                sourceImagePath: result.image_path,
-              })
-              generatedImagePath = artifacts.generatedImagePath
-              previewImagePath = artifacts.previewImagePath
-              contextThumbPath = artifacts.contextThumbPath
-              lastImagePath = generatedImagePath
-
-              await insertTaskRoundArtifact({
-                taskId,
-                roundIndex,
-                generatedImagePath,
-                previewImagePath,
-                contextThumbPath,
-                score: null,
-              })
-
-              pushEvent({
-                taskId,
-                phase: 'observe',
-                message: `round ${roundIndex + 1} image generated`,
-                retryCount,
-                roundIndex,
-                generatedImagePath,
-                previewImagePath: previewImagePath ?? generatedImagePath,
-                timestamp: Date.now(),
-              })
-
-              return {
-                content: [{ type: 'text', text: JSON.stringify({ ...result, image_path: generatedImagePath }) }],
-                structuredContent: { ...result, image_path: generatedImagePath },
-              }
-            },
-          ),
-          tool(
-            'evaluate_image',
-            'Evaluate generated image quality',
-            {
-              image_path: z.string().optional(),
-              product_name: z.string().optional(),
-              context: z.string().optional(),
-            },
-            async (args) => {
-              const targetImagePath = (args.image_path ?? generatedImagePath ?? '').trim()
-              if (!targetImagePath) {
-                return {
-                  content: [{ type: 'text', text: 'Error: no generated image to evaluate' }],
-                  isError: true,
-                }
-              }
-
-              const evalInput = {
-                image_path: targetImagePath,
-                product_name: args.product_name ?? input.productName,
-                context: args.context ?? input.context,
-                rubric: options.evaluationRubric,
-                pass_threshold: options.scoreThreshold,
-              }
-
-              pushEvent({
-                taskId,
-                phase: 'observe',
-                message: `evaluate_image args=${JSON.stringify(evalInput)}`,
-                retryCount,
-                roundIndex,
-                timestamp: Date.now(),
-              })
-
-              const result = (await mcpServer.callTool('evaluate_image', evalInput)) as {
-                total_score: number
-                defect_analysis: DefectAnalysis
-                passed: boolean
-                pass_threshold: number
-              }
-
-              roundEvalScore = result.total_score
-              roundDefect = result.defect_analysis
-
-              await updateTaskRoundArtifactScore({
-                taskId,
-                roundIndex,
-                score: roundEvalScore,
-              })
-
-              return {
-                content: [{ type: 'text', text: JSON.stringify(result) }],
-                structuredContent: result,
-              }
-            },
-          ),
-        ],
-      })
-
-      const imagePathsHint =
-        productImagePaths.length > 0
-          ? `\nUse ${productImagePaths.length} product images when calling generate_image.`
-          : ''
-
-      const prompt =
-        `Generate e-commerce image for product=${input.productName}, scene=${input.context}, sku=${input.skuId}.` +
-        imagePathsHint +
-        '\nYou must call generate_image first, then call evaluate_image. Do not stop at text output only.'
-      const allowedTools = [`mcp__${mcpServerName}__generate_image`, `mcp__${mcpServerName}__evaluate_image`]
-
-      const q = query({
-        prompt,
-        options: {
-          model: options.anthropicModel ?? DEFAULT_MODEL,
-          systemPrompt: composedSystemPrompt,
-          mcpServers: {
-            [mcpServerName]: sdkMcpServer,
+    const sdkMcpServer = createSdkMcpServer({
+      name: mcpServerName,
+      tools: [
+        tool(
+          'generate_image',
+          'Call image generation API and return local absolute file path',
+          {
+            prompt: z.string(),
+            style: z.string().optional(),
+            aspect_ratio: z.enum(['1:1', '4:3', '16:9']).optional(),
+            product_image_paths: z.array(z.string()).optional(),
+            reference_image_paths: z.array(z.string()).optional(),
           },
-          maxTurns: DEFAULT_MAX_TURNS,
-          permissionMode: 'default',
-          tools: [],
-          allowedTools,
-          canUseTool: async (toolName) => {
-            if (toolName.endsWith('__generate_image') || toolName.endsWith('__evaluate_image')) {
-              return { behavior: 'allow' }
+          async (args) => {
+            if (!activeRoundState) {
+              return {
+                content: [{ type: 'text', text: 'Error: no active round context for generate_image.' }],
+                isError: true,
+              }
             }
+
+            const roundIndex = activeRoundState.roundIndex
+            const retryRound = activeRoundState.retryCount
+            const enforcedPrompt = buildEnforcedGenerationPrompt({
+              productName: input.productName,
+              context: input.context,
+              userPrompt: input.userPrompt,
+              modelPrompt: args.prompt,
+              defectAnalysis: lastDefectAnalysis,
+              roundIndex,
+            })
+            const normalizedArgs = {
+              ...args,
+              prompt: enforcedPrompt,
+            }
+
+            pushEvent({
+              taskId,
+              phase: 'act',
+              message: `generate_image args=${JSON.stringify(normalizedArgs)}`,
+              retryCount: retryRound,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+
+            const result = (await mcpServer.callTool('generate_image', {
+              ...normalizedArgs,
+              product_image_paths: productImagePaths,
+              ...(referenceImagePaths?.length ? { reference_image_paths: referenceImagePaths } : {}),
+              product_name: input.productName,
+              context: input.context,
+              rubric: options.evaluationRubric,
+              pass_threshold: options.scoreThreshold,
+            })) as {
+              image_path: string
+              prompt_used: string
+            }
+
+            const artifacts = await persistRoundArtifacts({
+              taskId,
+              roundIndex,
+              sourceImagePath: result.image_path,
+            })
+            activeRoundState.generatedImagePath = artifacts.generatedImagePath
+            activeRoundState.previewImagePath = artifacts.previewImagePath
+            activeRoundState.contextThumbPath = artifacts.contextThumbPath
+            lastImagePath = artifacts.generatedImagePath
+
+            await insertTaskRoundArtifact({
+              taskId,
+              roundIndex,
+              generatedImagePath: artifacts.generatedImagePath,
+              previewImagePath: artifacts.previewImagePath,
+              contextThumbPath: artifacts.contextThumbPath,
+              score: null,
+            })
+
+            if (!retainedRoundIndexes.includes(roundIndex)) {
+              retainedRoundIndexes.push(roundIndex)
+            }
+
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `round ${roundIndex + 1} image generated`,
+              retryCount: retryRound,
+              roundIndex,
+              generatedImagePath: artifacts.generatedImagePath,
+              previewImagePath: artifacts.previewImagePath ?? artifacts.generatedImagePath,
+              timestamp: Date.now(),
+            })
+
             return {
-              behavior: 'deny',
-              message: `Tool denied: ${toolName}. Only generate_image/evaluate_image are allowed.`,
+              content: [{ type: 'text', text: JSON.stringify({ ...result, image_path: artifacts.generatedImagePath }) }],
+              structuredContent: { ...result, image_path: artifacts.generatedImagePath },
             }
           },
-          env: {
-            ...process.env,
-            ANTHROPIC_API_KEY: options.anthropicApiKey,
-            ...(options.anthropicBaseUrl ? { ANTHROPIC_BASE_URL: options.anthropicBaseUrl } : {}),
+          {
+            annotations: {
+              title: 'Generate Product Image',
+              readOnlyHint: false,
+              destructiveHint: false,
+              openWorldHint: true,
+              idempotentHint: false,
+            },
           },
-          includeHookEvents: true,
-          includePartialMessages: false,
-          settingSources: [],
-        },
-      })
+        ),
+        tool(
+          'evaluate_image',
+          'Evaluate generated image quality',
+          {
+            image_path: z.string().optional(),
+            product_name: z.string().optional(),
+            context: z.string().optional(),
+          },
+          async (args) => {
+            if (!activeRoundState) {
+              return {
+                content: [{ type: 'text', text: 'Error: no active round context for evaluate_image.' }],
+                isError: true,
+              }
+            }
 
-      try {
-        for await (const msg of q) {
-          this.handleSdkMessage(msg, {
-            pushEvent,
-            taskId,
-            retryCount,
-            roundIndex,
-          })
+            const roundIndex = activeRoundState.roundIndex
+            const retryRound = activeRoundState.retryCount
+            const targetImagePath = (args.image_path ?? activeRoundState.generatedImagePath ?? '').trim()
+            if (!targetImagePath) {
+              return {
+                content: [{ type: 'text', text: 'Error: no generated image to evaluate' }],
+                isError: true,
+              }
+            }
 
-          if (msg.type === 'result') {
-            resultMessage = msg
+            const evalInput = {
+              image_path: targetImagePath,
+              product_name: args.product_name ?? input.productName,
+              context: args.context ?? input.context,
+              rubric: options.evaluationRubric,
+              pass_threshold: options.scoreThreshold,
+            }
+
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `evaluate_image args=${JSON.stringify(evalInput)}`,
+              retryCount: retryRound,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+
+            const result = (await mcpServer.callTool('evaluate_image', evalInput)) as {
+              total_score: number
+              defect_analysis: DefectAnalysis
+              passed: boolean
+              pass_threshold: number
+            }
+
+            activeRoundState.roundEvalScore = result.total_score
+            activeRoundState.roundDefect = result.defect_analysis
+
+            await updateTaskRoundArtifactScore({
+              taskId,
+              roundIndex,
+              score: result.total_score,
+            })
+
+            return {
+              content: [{ type: 'text', text: JSON.stringify(result) }],
+              structuredContent: result,
+            }
+          },
+          {
+            annotations: {
+              title: 'Evaluate Product Image',
+              readOnlyHint: true,
+              openWorldHint: false,
+              idempotentHint: true,
+            },
+          },
+        ),
+      ],
+    })
+
+    const startMessagePump = (q: SDKQuery): void => {
+      queryPump = (async () => {
+        try {
+          for await (const msg of q) {
+            const eventRoundIndex = activeRoundState?.roundIndex ?? retryCount
+            const eventRetryCount = activeRoundState?.retryCount ?? retryCount
+            this.handleSdkMessage(msg, {
+              pushEvent,
+              taskId,
+              retryCount: eventRetryCount,
+              roundIndex: eventRoundIndex,
+            })
+
+            if (msg.type === 'result') {
+              if (activeRoundState) {
+                activeRoundState.resultMessage = msg
+              }
+              if (pendingRoundResult) {
+                pendingRoundResult.resolve(msg)
+                pendingRoundResult = null
+              }
+            }
+          }
+
+          if (pendingRoundResult) {
+            pendingRoundResult.reject(new Error('Claude SDK stream ended before a round result was produced.'))
+            pendingRoundResult = null
+          }
+        } catch (error: unknown) {
+          streamFailureReason = error instanceof Error ? error.message : String(error)
+          if (activeRoundState) {
+            activeRoundState.queryError = streamFailureReason
+          }
+          if (pendingRoundResult) {
+            pendingRoundResult.reject(new Error(streamFailureReason))
+            pendingRoundResult = null
           }
         }
-      } catch (error: unknown) {
-        queryError = error instanceof Error ? error.message : String(error)
-      }
+      })()
+    }
 
-      let contextUsage: LoopEvent['contextUsage'] | undefined
-      try {
-        const usage = await q.getContextUsage()
-        contextUsage = {
-          totalTokens: usage.totalTokens,
-          maxTokens: usage.maxTokens,
-          percentage: usage.percentage,
+    try {
+      while (retryCount <= options.maxRetries) {
+        if (signal.aborted) {
+          pushEvent({
+            taskId,
+            phase: 'failed',
+            message: 'Task aborted by user',
+            retryCount,
+            roundIndex: retryCount,
+            timestamp: Date.now(),
+          })
+          await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
+          return
         }
-      } catch {
-        contextUsage = this.deriveContextUsageFromResult(
-          resultMessage,
-          options.anthropicModel ?? DEFAULT_MODEL,
-        )
-      } finally {
-        q.close()
-      }
 
-      if (resultMessage?.total_cost_usd) {
-        totalCostUsd += resultMessage.total_cost_usd
-      }
+        const roundIndex = retryCount
+        const isLastRound = roundIndex >= options.maxRetries
+        roundsAttempted = roundIndex + 1
+        const compressionMode = pickCompressionMode(latestContextUsagePercentage, compressionThresholds)
+        const roundInstruction = buildRoundUserInstruction({
+          input,
+          roundIndex,
+          scoreThreshold: options.scoreThreshold,
+          defectAnalysis: lastDefectAnalysis,
+          productImageCount: productImagePaths.length,
+          compressionMode,
+        })
 
-      if (queryError) {
+        activeRoundState = createActiveRoundState(roundIndex, retryCount)
+        const roundResultPromise = new Promise<SDKResultMessage>((resolve, reject) => {
+          pendingRoundResult = { roundIndex, resolve, reject }
+        })
+
         pushEvent({
           taskId,
-          phase: 'observe',
-          message: `Claude SDK query error: ${queryError}`,
+          phase: 'thought',
+          message:
+            `Round ${roundIndex + 1} started with Claude SDK stream. product=${input.productName}` +
+            `, pass_threshold=${options.scoreThreshold}, max_retries=${options.maxRetries}`,
           retryCount,
           roundIndex,
-          contextUsage,
-          costUsd: totalCostUsd,
           timestamp: Date.now(),
         })
-      }
 
-      const resultDiagnostics = resultMessage ? this.collectResultDiagnostics(resultMessage) : null
-      if (resultDiagnostics) {
-        pushEvent({
-          taskId,
-          phase: 'observe',
-          message: `Claude SDK round diagnostics: ${resultDiagnostics.detail}`,
-          retryCount,
-          roundIndex,
-          contextUsage,
-          costUsd: totalCostUsd,
-          timestamp: Date.now(),
-        })
-      }
+        if (!queryInstance) {
+          queryInstance = query({
+            prompt: createUserMessageStream(roundInstruction),
+            options: {
+              model: options.anthropicModel ?? DEFAULT_MODEL,
+              systemPrompt: baseSystemPrompt,
+              cwd: isolatedProjectDir,
+              persistSession: true,
+              settingSources: ['project'],
+              mcpServers: {
+                [mcpServerName]: sdkMcpServer,
+              },
+              maxTurns: DEFAULT_MAX_TURNS,
+              permissionMode: 'default',
+              tools: [],
+              allowedTools,
+              canUseTool: async (toolName, toolInput) => {
+                if (toolName.endsWith('__generate_image')) {
+                  if (!activeRoundState) {
+                    return {
+                      behavior: 'deny',
+                      message: 'No active round context for generate_image.',
+                    }
+                  }
+                  const normalizedInput =
+                    typeof toolInput === 'object' && toolInput !== null
+                      ? { ...(toolInput as Record<string, unknown>) }
+                      : {}
+                  const draftPrompt =
+                    typeof normalizedInput.prompt === 'string' ? normalizedInput.prompt : ''
+                  const enforcedPrompt = buildEnforcedGenerationPrompt({
+                    productName: input.productName,
+                    context: input.context,
+                    userPrompt: input.userPrompt,
+                    modelPrompt: draftPrompt,
+                    defectAnalysis: lastDefectAnalysis,
+                    roundIndex: activeRoundState.roundIndex,
+                  })
+                  return {
+                    behavior: 'allow',
+                    updatedInput: {
+                      ...normalizedInput,
+                      prompt: enforcedPrompt,
+                    },
+                  }
+                }
 
-      if (generatedImagePath && roundEvalScore === null) {
+                if (toolName.endsWith('__evaluate_image')) {
+                  return { behavior: 'allow' }
+                }
+
+                return {
+                  behavior: 'deny',
+                  message: `Tool denied: ${toolName}. Only generate_image/evaluate_image are allowed.`,
+                }
+              },
+              env: {
+                ...process.env,
+                ANTHROPIC_API_KEY: options.anthropicApiKey,
+                ...(options.anthropicBaseUrl ? { ANTHROPIC_BASE_URL: options.anthropicBaseUrl } : {}),
+              },
+              includeHookEvents: true,
+              includePartialMessages: false,
+            },
+          })
+          startMessagePump(queryInstance)
+        } else {
+          try {
+            await queryInstance.streamInput(createUserMessageStream(roundInstruction))
+          } catch (error: unknown) {
+            const errMsg = error instanceof Error ? error.message : String(error)
+            activeRoundState.queryError = errMsg
+            const pending = pendingRoundResult as
+              | {
+                  reject: (error: Error) => void
+                }
+              | null
+            if (pending) {
+              pending.reject(new Error(errMsg))
+              pendingRoundResult = null
+            }
+          }
+        }
+
+        if (!queryBootstrapDone && queryInstance) {
+          try {
+            const init = await queryInstance.initializationResult()
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `SDK initialized. models=${init.models.length}, agents=${init.agents.length}, commands=${init.commands.length}`,
+              retryCount,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+
+            const statuses = await queryInstance.mcpServerStatus()
+            const statusLine =
+              statuses.length === 0 ? 'none' : statuses.map((item) => `${item.name}:${item.status}`).join(', ')
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `MCP status: ${statusLine}`,
+              retryCount,
+              roundIndex,
+              timestamp: Date.now(),
+            })
+            const unhealthy = statuses.find(
+              (item) => item.status !== 'connected' && item.status !== 'pending',
+            )
+            if (unhealthy) {
+              throw new Error(`MCP server unhealthy: ${unhealthy.name} (${unhealthy.status})`)
+            }
+            queryBootstrapDone = true
+          } catch (error: unknown) {
+            terminalFailureReason = `sdk_bootstrap_failed: ${error instanceof Error ? error.message : String(error)}`
+            pendingRoundResult = null
+            break
+          }
+        }
+
+        if (!activeRoundState.queryError) {
+          try {
+            await this.awaitRoundResult(roundResultPromise, signal, queryInstance!)
+          } catch (error: unknown) {
+            activeRoundState.queryError = error instanceof Error ? error.message : String(error)
+          }
+        }
+
+        if (activeRoundState.resultMessage?.total_cost_usd) {
+          totalCostUsd += activeRoundState.resultMessage.total_cost_usd
+        }
+
+        let contextUsage: LoopEvent['contextUsage'] | undefined
         try {
-          const fallback = (await mcpServer.callTool('evaluate_image', {
-            image_path: generatedImagePath,
-            product_name: input.productName,
-            context: input.context,
-            rubric: options.evaluationRubric,
-            pass_threshold: options.scoreThreshold,
-          })) as { total_score: number; defect_analysis: DefectAnalysis }
-          roundEvalScore = fallback.total_score
-          roundDefect = fallback.defect_analysis
-          await updateTaskRoundArtifactScore({
-            taskId,
-            roundIndex,
-            score: roundEvalScore,
-            contextUsage: contextUsage ? JSON.stringify(contextUsage) : null,
-          })
-          pushEvent({
-            taskId,
-            phase: 'observe',
-            message: 'evaluate_image fallback succeeded',
-            retryCount,
-            roundIndex,
-            contextUsage,
-            timestamp: Date.now(),
-          })
-        } catch (error: unknown) {
-          const err = error instanceof Error ? error.message : String(error)
-          pushEvent({
-            taskId,
-            phase: 'observe',
-            message: `evaluate_image fallback failed: ${err}`,
-            retryCount,
-            roundIndex,
-            contextUsage,
-            timestamp: Date.now(),
-          })
+          const usage = await queryInstance!.getContextUsage()
+          contextUsage = {
+            totalTokens: usage.totalTokens,
+            maxTokens: usage.maxTokens,
+            percentage: usage.percentage,
+          }
+        } catch {
+          contextUsage = this.deriveContextUsageFromResult(
+            activeRoundState.resultMessage,
+            options.anthropicModel ?? DEFAULT_MODEL,
+          )
         }
-      }
 
-      if (!generatedImagePath || roundEvalScore === null || !roundDefect) {
-        const roundFailure = buildRoundFailureDiagnostics({
-          generatedImagePath,
-          roundEvalScore,
-          queryError,
-          resultDiagnostics,
-        })
+        if (contextUsage) {
+          latestContextUsagePercentage = contextUsage.percentage
+        }
 
-        if (!isLastRound) {
+        let generatedImagePath = activeRoundState.generatedImagePath
+        let previewImagePath = activeRoundState.previewImagePath
+        let contextThumbPath = activeRoundState.contextThumbPath
+        let roundEvalScore = activeRoundState.roundEvalScore
+        let roundDefect = activeRoundState.roundDefect
+        let queryError = activeRoundState.queryError
+
+        if (!queryError && streamFailureReason) {
+          queryError = streamFailureReason
+        }
+
+        if (queryError) {
           pushEvent({
             taskId,
             phase: 'observe',
-            message: `Round incomplete, continue retry. ${roundFailure.detail}`,
+            message: `Claude SDK query error: ${queryError}`,
             retryCount,
             roundIndex,
             contextUsage,
             costUsd: totalCostUsd,
             timestamp: Date.now(),
           })
-          retryCount += 1
-          continue
         }
 
-        pushEvent({
-          taskId,
-          phase: 'observe',
-          message: `Last round fallback start. ${roundFailure.detail}`,
-          retryCount,
-          roundIndex,
-          contextUsage,
-          costUsd: totalCostUsd,
-          timestamp: Date.now(),
-        })
-
-        try {
-          const fallbackResult = await this.executeLastRoundFallback({
-            input,
-            taskId,
-            roundIndex,
-            mcpServer,
-            pushEvent,
-            retryCount,
-            generatedImagePath,
-            previewImagePath,
-            contextThumbPath,
-            roundEvalScore,
-            roundDefect,
-            productImagePaths,
-            referenceImagePaths,
-            scoreThreshold: options.scoreThreshold,
-            evaluationRubric: options.evaluationRubric,
-            contextUsage,
-            lastDefectAnalysis,
-          })
-          generatedImagePath = fallbackResult.generatedImagePath
-          previewImagePath = fallbackResult.previewImagePath
-          contextThumbPath = fallbackResult.contextThumbPath
-          roundEvalScore = fallbackResult.roundEvalScore
-          roundDefect = fallbackResult.roundDefect
-          lastImagePath = generatedImagePath
-        } catch (error: unknown) {
-          const err = error instanceof Error ? error.message : String(error)
-          terminalFailureReason = `last_round_fallback_failed: ${err}`
-          break
-        }
-      }
-
-      await updateTaskRoundArtifactScore({
-        taskId,
-        roundIndex,
-        score: roundEvalScore,
-        contextUsage: contextUsage ? JSON.stringify(contextUsage) : null,
-      })
-
-      const keywords = roundDefect.dimensions
-        .flatMap((dimension) => [dimension.name, ...dimension.issues.slice(0, 2)])
-        .filter((item) => item && item.trim().length > 0)
-        .slice(0, 10)
-
-      memoryLedger.addEntry({
-        roundIndex,
-        promptSummary:
-          resultMessage && resultMessage.type === 'result' && resultMessage.subtype === 'success'
-            ? resultMessage.result.slice(0, 180)
-            : `round ${roundIndex + 1} completed`,
-        actionSummary: `generated and evaluated image with score ${roundEvalScore}`,
-        score: roundEvalScore,
-        defectAnalysis: roundDefect,
-        keywords,
-        generatedImagePath,
-        contextThumbPath,
-      })
-
-      if (contextUsage) {
-        const level = memoryLedger.updateCompressionByUsage(contextUsage.percentage)
-        if (level !== 'none') {
+        const resultDiagnostics = activeRoundState.resultMessage
+          ? this.collectResultDiagnostics(activeRoundState.resultMessage)
+          : null
+        if (resultDiagnostics) {
           pushEvent({
             taskId,
             phase: 'observe',
-            message: `context usage ${contextUsage.percentage.toFixed(1)}%, compression level=${level.toUpperCase()}`,
+            message: `Claude SDK round diagnostics: ${resultDiagnostics.detail}`,
+            retryCount,
+            roundIndex,
+            contextUsage,
+            costUsd: totalCostUsd,
+            timestamp: Date.now(),
+          })
+        }
+
+        if (generatedImagePath && roundEvalScore === null) {
+          try {
+            const fallback = (await mcpServer.callTool('evaluate_image', {
+              image_path: generatedImagePath,
+              product_name: input.productName,
+              context: input.context,
+              rubric: options.evaluationRubric,
+              pass_threshold: options.scoreThreshold,
+            })) as { total_score: number; defect_analysis: DefectAnalysis }
+            roundEvalScore = fallback.total_score
+            roundDefect = fallback.defect_analysis
+            await updateTaskRoundArtifactScore({
+              taskId,
+              roundIndex,
+              score: roundEvalScore,
+              contextUsage: contextUsage ? JSON.stringify(contextUsage) : null,
+            })
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: 'evaluate_image fallback succeeded',
+              retryCount,
+              roundIndex,
+              contextUsage,
+              timestamp: Date.now(),
+            })
+          } catch (error: unknown) {
+            const err = error instanceof Error ? error.message : String(error)
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `evaluate_image fallback failed: ${err}`,
+              retryCount,
+              roundIndex,
+              contextUsage,
+              timestamp: Date.now(),
+            })
+          }
+        }
+
+        if (!generatedImagePath || roundEvalScore === null || !roundDefect) {
+          const roundFailure = buildRoundFailureDiagnostics({
+            generatedImagePath,
+            roundEvalScore,
+            queryError,
+            resultDiagnostics,
+          })
+
+          if (!isLastRound) {
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `Round incomplete, continue retry. ${roundFailure.detail}`,
+              retryCount,
+              roundIndex,
+              contextUsage,
+              costUsd: totalCostUsd,
+              timestamp: Date.now(),
+            })
+            activeRoundState = null
+            retryCount += 1
+            continue
+          }
+
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message: `Last round fallback start. ${roundFailure.detail}`,
+            retryCount,
+            roundIndex,
+            contextUsage,
+            costUsd: totalCostUsd,
+            timestamp: Date.now(),
+          })
+
+          try {
+            const fallbackResult = await this.executeLastRoundFallback({
+              input,
+              taskId,
+              roundIndex,
+              mcpServer,
+              pushEvent,
+              retryCount,
+              generatedImagePath,
+              previewImagePath,
+              contextThumbPath,
+              roundEvalScore,
+              roundDefect,
+              productImagePaths,
+              referenceImagePaths,
+              scoreThreshold: options.scoreThreshold,
+              evaluationRubric: options.evaluationRubric,
+              contextUsage,
+              lastDefectAnalysis,
+            })
+            generatedImagePath = fallbackResult.generatedImagePath
+            previewImagePath = fallbackResult.previewImagePath
+            contextThumbPath = fallbackResult.contextThumbPath
+            roundEvalScore = fallbackResult.roundEvalScore
+            roundDefect = fallbackResult.roundDefect
+            lastImagePath = generatedImagePath
+            if (!retainedRoundIndexes.includes(roundIndex)) {
+              retainedRoundIndexes.push(roundIndex)
+            }
+          } catch (error: unknown) {
+            const err = error instanceof Error ? error.message : String(error)
+            terminalFailureReason = `last_round_fallback_failed: ${err}`
+            break
+          }
+        }
+
+        await updateTaskRoundArtifactScore({
+          taskId,
+          roundIndex,
+          score: roundEvalScore,
+          contextUsage: contextUsage ? JSON.stringify(contextUsage) : null,
+        })
+
+        await pruneRoundOriginalCache({
+          taskId,
+          keepRoundIndexes: retainedRoundIndexes.slice(-DEFAULT_MAX_ORIGINAL_ROUNDS),
+          maxOriginalRounds: DEFAULT_MAX_ORIGINAL_ROUNDS,
+        })
+
+        const compressionLevel = contextUsage
+          ? pickCompressionMode(contextUsage.percentage, compressionThresholds)
+          : 'none'
+        if (compressionLevel !== 'none' && contextUsage) {
+          pushEvent({
+            taskId,
+            phase: 'observe',
+            message: `context usage ${contextUsage.percentage.toFixed(1)}%, next round prompt mode=${compressionLevel.toUpperCase()}`,
             retryCount,
             roundIndex,
             contextUsage,
             timestamp: Date.now(),
           })
         }
-      }
-
-      await pruneRoundOriginalCache({
-        taskId,
-        keepRoundIndexes: memoryLedger.getKeepRoundIndexes(),
-        maxOriginalRounds: DEFAULT_MAX_ORIGINAL_ROUNDS,
-      })
-
-      pushEvent({
-        taskId,
-        phase: 'observe',
-        message: `score result: ${roundEvalScore} / 100`,
-        score: roundEvalScore,
-        defectAnalysis: roundDefect,
-        retryCount,
-        roundIndex,
-        generatedImagePath,
-        previewImagePath: previewImagePath ?? generatedImagePath,
-        contextUsage,
-        costUsd: totalCostUsd,
-        timestamp: Date.now(),
-      })
-
-      if (roundEvalScore >= options.scoreThreshold) {
-        const destPath = path.join(readyDir, `${taskId}_${roundIndex}.png`)
-        await fs.copyFile(generatedImagePath, destPath)
-        await updateTaskSuccess({
-          taskId,
-          totalScore: roundEvalScore,
-          defectAnalysis: JSON.stringify(roundDefect),
-          imagePath: destPath,
-          retryCount,
-          costUsd: totalCostUsd,
-        })
 
         pushEvent({
           taskId,
-          phase: 'success',
-          message: `Task succeeded with score=${roundEvalScore}, total_cost=$${totalCostUsd.toFixed(4)}`,
+          phase: 'observe',
+          message: `score result: ${roundEvalScore} / 100`,
           score: roundEvalScore,
+          defectAnalysis: roundDefect,
           retryCount,
           roundIndex,
           generatedImagePath,
@@ -641,29 +893,72 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
           costUsd: totalCostUsd,
           timestamp: Date.now(),
         })
-        return
+
+        if (roundEvalScore >= options.scoreThreshold) {
+          const destPath = path.join(readyDir, `${taskId}_${roundIndex}.png`)
+          await fs.copyFile(generatedImagePath, destPath)
+          await updateTaskSuccess({
+            taskId,
+            totalScore: roundEvalScore,
+            defectAnalysis: JSON.stringify(roundDefect),
+            imagePath: destPath,
+            retryCount,
+            costUsd: totalCostUsd,
+          })
+
+          pushEvent({
+            taskId,
+            phase: 'success',
+            message: `Task succeeded with score=${roundEvalScore}, total_cost=$${totalCostUsd.toFixed(4)}`,
+            score: roundEvalScore,
+            retryCount,
+            roundIndex,
+            generatedImagePath,
+            previewImagePath: previewImagePath ?? generatedImagePath,
+            contextUsage,
+            costUsd: totalCostUsd,
+            timestamp: Date.now(),
+          })
+          return
+        }
+
+        lastDefectAnalysis = roundDefect
+        activeRoundState = null
+        retryCount += 1
       }
 
-      lastDefectAnalysis = roundDefect
-      retryCount += 1
+      if (lastImagePath) {
+        const destPath = path.join(failedDir, `${taskId}_final.png`)
+        await fs.copyFile(lastImagePath, destPath)
+      }
+      await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
+      const attemptSummary = buildAttemptSummary(Math.max(1, roundsAttempted), options.maxRetries)
+      const reasonSuffix = terminalFailureReason ? `, reason=${terminalFailureReason}` : ''
+      pushEvent({
+        taskId,
+        phase: 'failed',
+        message: `Task failed after rounds ${attemptSummary}, total_cost=$${totalCostUsd.toFixed(4)}${reasonSuffix}`,
+        retryCount,
+        roundIndex: retryCount,
+        costUsd: totalCostUsd,
+        timestamp: Date.now(),
+      })
+    } finally {
+      if (queryInstance) {
+        try {
+          queryInstance.close()
+        } catch {
+          // Ignore close errors.
+        }
+      }
+      if (queryPump) {
+        try {
+          await queryPump
+        } catch {
+          // Ignore stream close errors.
+        }
+      }
     }
-
-    if (lastImagePath) {
-      const destPath = path.join(failedDir, `${taskId}_final.png`)
-      await fs.copyFile(lastImagePath, destPath)
-    }
-    await updateTaskFailed({ taskId, retryCount, costUsd: totalCostUsd })
-    const attemptSummary = buildAttemptSummary(Math.max(1, roundsAttempted), options.maxRetries)
-    const reasonSuffix = terminalFailureReason ? `, reason=${terminalFailureReason}` : ''
-    pushEvent({
-      taskId,
-      phase: 'failed',
-      message: `Task failed after rounds ${attemptSummary}, total_cost=$${totalCostUsd.toFixed(4)}${reasonSuffix}`,
-      retryCount,
-      roundIndex: retryCount,
-      costUsd: totalCostUsd,
-      timestamp: Date.now(),
-    })
   }
 
   private collectResultDiagnostics(message: SDKResultMessage): ResultDiagnostics {
@@ -739,7 +1034,14 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
 
     if (!generatedImagePath) {
       const generated = (await params.mcpServer.callTool('generate_image', {
-        prompt: buildFinalFallbackPrompt(params.input, params.lastDefectAnalysis),
+        prompt: buildEnforcedGenerationPrompt({
+          productName: params.input.productName,
+          context: params.input.context,
+          userPrompt: params.input.userPrompt,
+          modelPrompt: buildFallbackDraftPrompt(params.input.productName, params.input.context),
+          defectAnalysis: params.lastDefectAnalysis,
+          roundIndex: params.roundIndex,
+        }),
         product_image_paths: params.productImagePaths,
         ...(params.referenceImagePaths?.length
           ? { reference_image_paths: params.referenceImagePaths }
@@ -823,6 +1125,55 @@ export class ClaudeSdkAgentEngine implements AgentEngine {
       roundEvalScore,
       roundDefect,
     }
+  }
+
+  private async awaitRoundResult(
+    roundPromise: Promise<SDKResultMessage>,
+    signal: AbortSignal,
+    q: SDKQuery,
+  ): Promise<SDKResultMessage> {
+    if (signal.aborted) {
+      try {
+        await q.interrupt()
+      } catch {
+        // Ignore interrupt errors.
+      }
+      throw new Error('Task aborted by user')
+    }
+
+    return await new Promise<SDKResultMessage>((resolve, reject) => {
+      let settled = false
+      const finish = (handler: () => void): void => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', onAbort)
+        handler()
+      }
+
+      const onAbort = (): void => {
+        finish(() => {
+          void q.interrupt().catch(() => {
+            // Ignore interrupt errors.
+          })
+          reject(new Error('Task aborted by user'))
+        })
+      }
+
+      signal.addEventListener('abort', onAbort, { once: true })
+
+      roundPromise
+        .then((message) => {
+          finish(() => {
+            resolve(message)
+          })
+        })
+        .catch((error: unknown) => {
+          finish(() => {
+            const err = error instanceof Error ? error : new Error(String(error))
+            reject(err)
+          })
+        })
+    })
   }
 
   private deriveContextUsageFromResult(

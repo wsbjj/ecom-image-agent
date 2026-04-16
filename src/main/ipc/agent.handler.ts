@@ -50,7 +50,10 @@ function parseAgentScoreThreshold(rawValue: string | undefined): number {
 
 function parseEngineName(rawValue: string | undefined): AgentEngineName {
   if (!rawValue) return 'claude_sdk'
-  return rawValue.trim() === 'legacy' ? 'legacy' : 'claude_sdk'
+  const normalized = rawValue.trim()
+  if (normalized === 'legacy') return 'legacy'
+  if (normalized === 'codex_sdk') return 'codex_sdk'
+  return 'claude_sdk'
 }
 
 function parseRatio(rawValue: string | undefined): number {
@@ -175,6 +178,14 @@ async function resolveEvaluationTemplate(input: TaskInput): Promise<{
 
 export function registerAgentHandlers(win: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.TASK_START, async (_event, input: TaskInput): Promise<{ taskId: string }> => {
+    const engineName = parseEngineName(await getOptionalDecryptedValue('AGENT_ENGINE'))
+    const codexApiKey = await getOptionalDecryptedValue('CODEX_API_KEY')
+    const codexBaseUrl = await getOptionalDecryptedValue('CODEX_BASE_URL')
+    const codexModel = await getOptionalDecryptedValue('CODEX_MODEL')
+    if (engineName === 'codex_sdk' && !codexApiKey) {
+      throw new Error('配置项 CODEX_API_KEY 未设置，请先在 Settings 页面配置')
+    }
+
     if (!vlmStarted) {
       const pythonPath = resolvePythonPath()
       const anthropicKey = await getDecryptedKey('ANTHROPIC_API_KEY')
@@ -208,8 +219,6 @@ export function registerAgentHandlers(win: BrowserWindow): void {
     const scoreThresholdFromConfig = parseAgentScoreThreshold(
       await getOptionalDecryptedValue('AGENT_SCORE_THRESHOLD'),
     )
-
-    const engineName = parseEngineName(await getOptionalDecryptedValue('AGENT_ENGINE'))
 
     const retentionRatio = parseRatio(await getOptionalDecryptedValue('CONTEXT_RETENTION_RATIO'))
     const compressionSoft = parseCompressionThreshold(
@@ -250,6 +259,9 @@ export function registerAgentHandlers(win: BrowserWindow): void {
           anthropicApiKey: anthropicKey,
           anthropicBaseUrl,
           anthropicModel,
+          codexApiKey,
+          codexBaseUrl,
+          codexModel,
           maxRetries,
           scoreThreshold,
           evaluationTemplate: evalTemplate.template,

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Settings } from '../../../src/renderer/pages/Settings'
 import { useConfigStore } from '../../../src/renderer/store/config.store'
@@ -79,6 +79,36 @@ describe('Settings', () => {
 
     expect(window.api.testAnthropicConnection).toHaveBeenCalled()
     expect((await screen.findAllByText(/Anthropic 连接测试成功/)).length).toBeGreaterThan(0)
+  })
+
+  it('can test codex connection from settings page', async () => {
+    vi.mocked(window.api.getConfigValue).mockImplementation(async (key: string) => {
+      if (key === 'ANTHROPIC_API_KEY') {
+        return { value: 'sk-ant-test-123456' }
+      }
+      if (key === 'CODEX_API_KEY') {
+        return { value: 'codex-key-test-123456' }
+      }
+      if (key === 'IMAGE_PROVIDER') {
+        return { value: 'gemini' }
+      }
+      return { value: null }
+    })
+    vi.mocked(window.api.testCodexConnection).mockResolvedValue({
+      success: true,
+      message: 'ok',
+    })
+
+    render(<Settings />)
+    const user = userEvent.setup()
+    await screen.findByDisplayValue('codex-key-test-123456')
+    const codexCard = screen.getByText('Codex API 密钥').closest('div[class*="bg-gray-800"]')
+    expect(codexCard).toBeTruthy()
+    const codexTestButton = within(codexCard as HTMLElement).getByRole('button', { name: '测试连接' })
+    await user.click(codexTestButton)
+
+    expect(window.api.testCodexConnection).toHaveBeenCalled()
+    expect((await screen.findAllByText(/Codex 连接测试成功/)).length).toBeGreaterThan(0)
   })
 
   it('can test image provider connection from settings page', async () => {

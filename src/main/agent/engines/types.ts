@@ -8,6 +8,9 @@ export interface EngineRuntimeOptions {
   anthropicApiKey: string
   anthropicBaseUrl?: string
   anthropicModel?: string
+  codexApiKey?: string
+  codexBaseUrl?: string
+  codexModel?: string
   maxRetries: number
   scoreThreshold: number
   evaluationTemplate: EvaluationTemplateRecord
@@ -19,7 +22,7 @@ export interface EngineRuntimeOptions {
 }
 
 export interface AgentEngine {
-  readonly name: 'legacy' | 'claude_sdk'
+  readonly name: 'legacy' | 'claude_sdk' | 'codex_sdk'
   run(
     input: TaskInput,
     win: BrowserWindow,

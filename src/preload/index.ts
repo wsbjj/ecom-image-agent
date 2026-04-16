@@ -10,6 +10,8 @@ import type {
   EvaluationTemplateInput,
   EvaluationTemplateRecord,
   TaskRoundArtifactRecord,
+  EvalTemplateDraftRequest,
+  EvalTemplateDraftResponse,
 } from '../shared/types'
 
 const api = {
@@ -50,6 +52,13 @@ const api = {
   }): Promise<{ success: boolean; message: string }> =>
     ipcRenderer.invoke(IPC_CHANNELS.CONFIG_TEST_ANTHROPIC, params),
 
+  testCodexConnection: (params: {
+    apiKey?: string
+    baseUrl?: string
+    model?: string
+  }): Promise<{ success: boolean; message: string }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.CONFIG_TEST_CODEX, params),
+
   testImageProviderConnection: (params: {
     provider: ImageProviderName
     apiKey?: string
@@ -86,6 +95,11 @@ const api = {
 
   deleteEvaluationTemplate: (id: number): Promise<{ success: boolean }> =>
     ipcRenderer.invoke(IPC_CHANNELS.EVAL_TEMPLATE_DELETE, id),
+
+  generateEvaluationTemplateDraft: (
+    payload: EvalTemplateDraftRequest,
+  ): Promise<EvalTemplateDraftResponse> =>
+    ipcRenderer.invoke(IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_DRAFT, payload),
 
   generateStandardEvaluationTemplate: (): Promise<EvaluationTemplateRecord> =>
     ipcRenderer.invoke(IPC_CHANNELS.EVAL_TEMPLATE_GENERATE_STANDARD),

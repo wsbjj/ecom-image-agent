@@ -6,6 +6,7 @@ import { createMcpServer, type McpServer } from './mcp-server'
 import type { VLMEvalBridge } from './vlmeval-bridge'
 import type { ImageProvider } from './providers/base'
 import { buildSystemPrompt } from './prompt-builder'
+import { buildEnforcedGenerationPrompt, buildFallbackDraftPrompt } from './enforced-generation-prompt'
 import { updateTaskSuccess, updateTaskFailed } from '../db/queries'
 import { v4 as uuidv4 } from 'uuid'
 import * as fs from 'node:fs/promises'
@@ -66,21 +67,6 @@ function buildRoundFailureDiagnostics(input: RoundFailureDiagnosticsInput): {
     failureTypes: normalizedFailureTypes,
     detail: detailParts.join(', '),
   }
-}
-
-function buildFinalFallbackPrompt(input: TaskInput, lastDefectAnalysis: DefectAnalysis | null): string {
-  const defectHint =
-    lastDefectAnalysis && Array.isArray(lastDefectAnalysis.dimensions)
-      ? lastDefectAnalysis.dimensions
-          .flatMap((dimension) => dimension.issues.slice(0, 1))
-          .filter((issue) => issue.trim().length > 0)
-          .slice(0, 3)
-          .join('; ')
-      : ''
-
-  return defectHint
-    ? `Generate a realistic e-commerce image for ${input.productName} in ${input.context}. Fix previous issues: ${defectHint}.`
-    : `Generate a realistic e-commerce image for ${input.productName} in ${input.context}.`
 }
 
 function buildAttemptSummary(roundsAttempted: number, maxRetries: number): string {
@@ -267,10 +253,19 @@ export async function runAgentLoop(
         })
 
         try {
+          const toolInput = block.input as Record<string, unknown>
           const normalizedToolInput =
             block.name === 'generate_image'
               ? {
-                  ...(block.input as Record<string, unknown>),
+                  ...toolInput,
+                  prompt: buildEnforcedGenerationPrompt({
+                    productName: input.productName,
+                    context: input.context,
+                    userPrompt: input.userPrompt,
+                    modelPrompt: typeof toolInput.prompt === 'string' ? toolInput.prompt : '',
+                    defectAnalysis: lastDefectAnalysis,
+                    roundIndex,
+                  }),
                   product_image_paths: productImagePaths,
                   ...(referenceImagePaths?.length ? { reference_image_paths: referenceImagePaths } : {}),
                   product_name: input.productName,
@@ -278,13 +273,13 @@ export async function runAgentLoop(
                   rubric: options.evaluationRubric,
                   pass_threshold: scoreThreshold,
                 }
-              : block.name === 'evaluate_image'
+                : block.name === 'evaluate_image'
                 ? {
-                    ...(block.input as Record<string, unknown>),
+                    ...toolInput,
                     rubric: options.evaluationRubric,
                     pass_threshold: scoreThreshold,
                   }
-                : (block.input as Record<string, unknown>)
+                : toolInput
 
           const result = await mcpServer.callTool(block.name, normalizedToolInput)
 
@@ -484,7 +479,14 @@ export async function runAgentLoop(
       try {
         if (!generatedImagePath) {
           const generated = (await mcpServer.callTool('generate_image', {
-            prompt: buildFinalFallbackPrompt(input, lastDefectAnalysis),
+            prompt: buildEnforcedGenerationPrompt({
+              productName: input.productName,
+              context: input.context,
+              userPrompt: input.userPrompt,
+              modelPrompt: buildFallbackDraftPrompt(input.productName, input.context),
+              defectAnalysis: lastDefectAnalysis,
+              roundIndex,
+            }),
             product_image_paths: productImagePaths,
             ...(referenceImagePaths?.length ? { reference_image_paths: referenceImagePaths } : {}),
             product_name: input.productName,

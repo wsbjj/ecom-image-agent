@@ -8,7 +8,8 @@ const MAX_AGENT_MAX_RETRIES = 10
 const DEFAULT_AGENT_SCORE_THRESHOLD = 85
 const MIN_AGENT_SCORE_THRESHOLD = 0
 const MAX_AGENT_SCORE_THRESHOLD = 100
-const DEFAULT_AGENT_ENGINE: 'claude_sdk' | 'legacy' = 'claude_sdk'
+const DEFAULT_AGENT_ENGINE: 'claude_sdk' | 'codex_sdk' | 'legacy' = 'claude_sdk'
+const DEFAULT_CODEX_MODEL = 'gpt-5.4'
 const DEFAULT_CONTEXT_RETENTION_RATIO = 0.3
 const MIN_CONTEXT_RETENTION_RATIO = 0.1
 const MAX_CONTEXT_RETENTION_RATIO = 0.9
@@ -104,9 +105,13 @@ export function Settings() {
   const [seedreamVisualReqKey, setSeedreamVisualReqKey] = useState('high_aes_general_v30l_zt2i')
   const [anthropicBaseUrl, setAnthropicBaseUrl] = useState('')
   const [anthropicModel, setAnthropicModel] = useState('')
+  const [codexInput, setCodexInput] = useState('')
+  const [codexBaseUrl, setCodexBaseUrl] = useState('')
+  const [codexModel, setCodexModel] = useState(DEFAULT_CODEX_MODEL)
   const [googleBaseUrl, setGoogleBaseUrl] = useState('')
   const [googleImageModel, setGoogleImageModel] = useState('')
   const [anthropicCustomEnabled, setAnthropicCustomEnabled] = useState(false)
+  const [codexCustomEnabled, setCodexCustomEnabled] = useState(false)
   const [googleCustomEnabled, setGoogleCustomEnabled] = useState(false)
   const [seedreamCustomEnabled, setSeedreamCustomEnabled] = useState(false)
   const [userDataPath, setUserDataPath] = useState<string>('%APPDATA%/ecom-image-agent')
@@ -116,7 +121,9 @@ export function Settings() {
   const [agentScoreThresholdInput, setAgentScoreThresholdInput] = useState(
     String(DEFAULT_AGENT_SCORE_THRESHOLD),
   )
-  const [agentEngine, setAgentEngine] = useState<'claude_sdk' | 'legacy'>(DEFAULT_AGENT_ENGINE)
+  const [agentEngine, setAgentEngine] = useState<'claude_sdk' | 'codex_sdk' | 'legacy'>(
+    DEFAULT_AGENT_ENGINE,
+  )
   const [contextRetentionRatioInput, setContextRetentionRatioInput] = useState(
     String(DEFAULT_CONTEXT_RETENTION_RATIO),
   )
@@ -132,8 +139,13 @@ export function Settings() {
   const [evalTemplateDefaultIdInput, setEvalTemplateDefaultIdInput] = useState('')
   const [saving, setSaving] = useState(false)
   const [testingAnthropic, setTestingAnthropic] = useState(false)
+  const [testingCodex, setTestingCodex] = useState(false)
   const [testingImageProvider, setTestingImageProvider] = useState<ImageProviderName | null>(null)
   const [anthropicTestMessage, setAnthropicTestMessage] = useState<{
+    type: 'success' | 'error'
+    text: string
+  } | null>(null)
+  const [codexTestMessage, setCodexTestMessage] = useState<{
     type: 'success' | 'error'
     text: string
   } | null>(null)
@@ -156,6 +168,9 @@ export function Settings() {
         seedreamBaseUrlResult,
         anthropicBaseUrlResult,
         anthropicModelResult,
+        codexKeyResult,
+        codexBaseUrlResult,
+        codexModelResult,
         googleBaseUrlResult,
         googleImageModelResult,
         seedreamCallModeResult,
@@ -178,6 +193,9 @@ export function Settings() {
         window.api.getConfigValue('SEEDREAM_BASE_URL'),
         window.api.getConfigValue('ANTHROPIC_BASE_URL'),
         window.api.getConfigValue('ANTHROPIC_MODEL'),
+        window.api.getConfigValue('CODEX_API_KEY'),
+        window.api.getConfigValue('CODEX_BASE_URL'),
+        window.api.getConfigValue('CODEX_MODEL'),
         window.api.getConfigValue('GOOGLE_BASE_URL'),
         window.api.getConfigValue('GOOGLE_IMAGE_MODEL'),
         window.api.getConfigValue('SEEDREAM_CALL_MODE'),
@@ -201,6 +219,9 @@ export function Settings() {
       const nextSeedreamBaseUrl = seedreamBaseUrlResult.value ?? ''
       const nextAnthropicBaseUrl = anthropicBaseUrlResult.value ?? ''
       const nextAnthropicModel = anthropicModelResult.value ?? ''
+      const nextCodexKey = codexKeyResult.value ?? ''
+      const nextCodexBaseUrl = codexBaseUrlResult.value ?? ''
+      const nextCodexModel = codexModelResult.value ?? DEFAULT_CODEX_MODEL
       const nextGoogleBaseUrl = googleBaseUrlResult.value ?? ''
       const nextGoogleImageModel = googleImageModelResult.value ?? ''
       const nextSeedreamCallMode =
@@ -213,7 +234,8 @@ export function Settings() {
       const nextAgentMaxRetries = normalizeAgentMaxRetries(agentMaxRetriesResult.value)
       const nextAgentScoreThreshold = normalizeAgentScoreThreshold(agentScoreThresholdResult.value)
       const nextAgentEngine =
-        (agentEngineResult.value as 'claude_sdk' | 'legacy' | null) ?? DEFAULT_AGENT_ENGINE
+        (agentEngineResult.value as 'claude_sdk' | 'codex_sdk' | 'legacy' | null) ??
+        DEFAULT_AGENT_ENGINE
       const nextContextRetentionRatio = normalizeContextRetentionRatio(
         contextRetentionRatioResult.value,
       )
@@ -238,6 +260,9 @@ export function Settings() {
       setSeedreamBaseUrl(nextSeedreamBaseUrl)
       setAnthropicBaseUrl(nextAnthropicBaseUrl)
       setAnthropicModel(nextAnthropicModel)
+      setCodexInput(nextCodexKey)
+      setCodexBaseUrl(nextCodexBaseUrl)
+      setCodexModel(nextCodexModel)
       setGoogleBaseUrl(nextGoogleBaseUrl)
       setGoogleImageModel(nextGoogleImageModel)
       setSeedreamCallMode(nextSeedreamCallMode)
@@ -253,6 +278,7 @@ export function Settings() {
       setContextCompressionCriticalInput(nextContextCompressionCritical)
       setEvalTemplateDefaultIdInput(nextEvalTemplateDefaultId)
       setAnthropicCustomEnabled(Boolean(nextAnthropicBaseUrl || nextAnthropicModel))
+      setCodexCustomEnabled(Boolean((codexBaseUrlResult.value ?? '') || (codexModelResult.value ?? '')))
       setGoogleCustomEnabled(Boolean(nextGoogleBaseUrl || nextGoogleImageModel))
       setSeedreamCustomEnabled(Boolean(nextSeedreamBaseUrl || nextSeedreamEndpointId))
     } catch (error) {
@@ -287,6 +313,7 @@ export function Settings() {
       if (ok) {
         setMessage({ type: 'success', text: `${label} 已保存` })
         if (key === 'ANTHROPIC_API_KEY') setAnthropicInput(trimmedValue)
+        if (key === 'CODEX_API_KEY') setCodexInput(trimmedValue)
         if (key === 'GOOGLE_API_KEY') setGoogleInput(trimmedValue)
         if (key === 'APIKEY_SEEDREAM') setSeedreamInput(trimmedValue)
       } else {
@@ -485,6 +512,41 @@ export function Settings() {
       setTestingAnthropic(false)
     }
   }, [anthropicInput, anthropicBaseUrl, anthropicModel])
+
+  const handleTestCodexConnection = useCallback(async () => {
+    if (!codexInput.trim()) {
+      const nextMessage = { type: 'error' as const, text: '请先输入 Codex API Key 后再测试。' }
+      setCodexTestMessage(nextMessage)
+      setMessage(nextMessage)
+      return
+    }
+
+    setTestingCodex(true)
+    setCodexTestMessage(null)
+    setMessage(null)
+    try {
+      const result = await window.api.testCodexConnection({
+        apiKey: codexInput,
+        baseUrl: codexBaseUrl,
+        model: codexModel,
+      })
+      const nextMessage = {
+        type: result.success ? 'success' : 'error',
+        text: result.success
+          ? `Codex 连接测试成功（模型：${codexModel.trim() || DEFAULT_CODEX_MODEL}）`
+          : `Codex 连接测试失败：${result.message}`,
+      } as const
+      setCodexTestMessage(nextMessage)
+      setMessage(nextMessage)
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      const nextMessage = { type: 'error' as const, text: `Codex 连接测试失败：${text}` }
+      setCodexTestMessage(nextMessage)
+      setMessage(nextMessage)
+    } finally {
+      setTestingCodex(false)
+    }
+  }, [codexInput, codexBaseUrl, codexModel])
 
   const handleTestImageProviderConnection = useCallback(
     async (provider: ImageProviderName) => {
@@ -960,6 +1022,108 @@ export function Settings() {
             )}
           </div>
         </div>
+
+        {/* Codex */}
+        <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-medium text-gray-200">Codex API 密钥</h3>
+              <p className="text-xs text-gray-500 mt-0.5">
+                用于 `codex_sdk` 的 Agent 编排，视觉评审仍使用 Anthropic。
+              </p>
+            </div>
+            {codexInput.trim() ? (
+              <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400">
+                已配置
+              </span>
+            ) : (
+              <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">
+                未配置
+              </span>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={codexInput}
+              onChange={(e) => setCodexInput(e.target.value)}
+              placeholder="请输入 codex-api-key"
+              className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+            />
+            <button
+              onClick={() =>
+                handleSave('CODEX_API_KEY', codexInput, 'Codex 密钥')
+              }
+              disabled={!codexInput.trim() || saving}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+            >
+              保存
+            </button>
+            <button
+              onClick={handleTestCodexConnection}
+              disabled={testingCodex || saving}
+              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+            >
+              {testingCodex ? '测试中...' : '测试连接'}
+            </button>
+          </div>
+          {codexTestMessage && (
+            <div
+              className={`rounded-lg px-3 py-2 text-xs ${
+                codexTestMessage.type === 'success'
+                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-red-500/10 text-red-400 border border-red-500/30'
+              }`}
+            >
+              {codexTestMessage.text}
+            </div>
+          )}
+
+          <div className="pt-2 border-t border-gray-700/50 space-y-3">
+            <label className="flex items-center gap-2 text-xs text-gray-400">
+              <input
+                type="checkbox"
+                checked={codexCustomEnabled}
+                onChange={(e) => setCodexCustomEnabled(e.target.checked)}
+              />
+              使用自定义 Codex API 配置
+            </label>
+
+            {codexCustomEnabled && (
+              <>
+                <input
+                  value={codexBaseUrl}
+                  onChange={(e) => setCodexBaseUrl(e.target.value)}
+                  placeholder="自定义 Base URL（可选）"
+                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                />
+                <input
+                  value={codexModel}
+                  onChange={(e) => setCodexModel(e.target.value)}
+                  placeholder={DEFAULT_CODEX_MODEL}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                />
+                <div className="flex justify-end">
+                  <button
+                    onClick={() =>
+                      handleSaveCustom(
+                        [
+                          { key: 'CODEX_BASE_URL', value: codexBaseUrl },
+                          { key: 'CODEX_MODEL', value: codexModel },
+                        ],
+                        'Codex 自定义配置',
+                      )
+                    }
+                    disabled={saving}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+                  >
+                    保存自定义配置
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       </section>
 
       <section className="space-y-4">
@@ -1034,16 +1198,17 @@ export function Settings() {
           <div>
             <h3 className="text-sm font-medium text-gray-200">Agent 引擎</h3>
             <p className="text-xs text-gray-500 mt-0.5">
-              默认使用 Claude SDK，全量编排支持上下文压缩与记忆管理；可回退 legacy 引擎。
+              默认使用 Claude SDK，也可切换 Codex SDK；legacy 仅作为回退引擎。
             </p>
           </div>
           <div className="flex gap-2 items-center">
             <select
               value={agentEngine}
-              onChange={(e) => setAgentEngine(e.target.value as 'claude_sdk' | 'legacy')}
+              onChange={(e) => setAgentEngine(e.target.value as 'claude_sdk' | 'codex_sdk' | 'legacy')}
               className="w-56 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
             >
               <option value="claude_sdk">claude_sdk（推荐）</option>
+              <option value="codex_sdk">codex_sdk</option>
               <option value="legacy">legacy（回退）</option>
             </select>
             <button
@@ -1150,7 +1315,7 @@ export function Settings() {
         <h2 className="text-lg font-semibold text-gray-200">关于</h2>
         <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 text-sm text-gray-400 space-y-1">
           <div>EcomAgent v1.0.0</div>
-          <div>Electron + React 19 + Claude Agent SDK</div>
+          <div>Electron + React 19 + Claude/Codex SDK</div>
           <div>
             数据存储位置:{' '}
             <span className="font-mono text-gray-500">{userDataPath}</span>

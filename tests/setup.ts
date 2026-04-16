@@ -11,6 +11,7 @@ const mockApi = {
   checkConfig: vi.fn().mockResolvedValue({ exists: false }),
   getConfigValue: vi.fn().mockResolvedValue({ value: null }),
   testAnthropicConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok' }),
+  testCodexConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok' }),
   testImageProviderConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok', durationMs: 100 }),
   getUserDataPath: vi.fn().mockResolvedValue({ path: 'C:/Users/test/AppData/Roaming/ecom-image-agent' }),
   readImageAsDataUrl: vi.fn().mockResolvedValue({ dataUrl: null }),
@@ -21,6 +22,11 @@ const mockApi = {
   saveEvaluationTemplate: vi.fn().mockResolvedValue({ success: true }),
   listEvaluationTemplates: vi.fn().mockResolvedValue([]),
   deleteEvaluationTemplate: vi.fn().mockResolvedValue({ success: true }),
+  generateEvaluationTemplateDraft: vi.fn().mockResolvedValue({
+    name: 'AI评估模板',
+    defaultThreshold: 85,
+    rubricMarkdown: '## 评分维度\n\n| key | 名称 | 满分 | 权重 | 描述 |\n| --- | --- | --- | --- | --- |\n| edge_distortion | 边缘畸变 | 30 | 0.3 | 检查商品边缘是否清晰 |\n\n## 评分说明\n\n保持写实一致性。',
+  }),
   generateStandardEvaluationTemplate: vi.fn().mockResolvedValue({
     id: 1,
     name: '默认电商评估标准',
