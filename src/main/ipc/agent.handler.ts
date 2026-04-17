@@ -1,8 +1,15 @@
 import { app, ipcMain, BrowserWindow, safeStorage } from 'electron'
 import * as fs from 'node:fs'
+import * as fsPromises from 'node:fs/promises'
 import * as path from 'node:path'
 import { IPC_CHANNELS } from '../../shared/ipc-channels'
-import type { TaskInput, ImageProviderName, AgentEngineName, EvalRubric } from '../../shared/types'
+import type {
+  TaskInput,
+  ImageProviderName,
+  AgentEngineName,
+  EvalRubric,
+  EvaluationBackendName,
+} from '../../shared/types'
 import type { ImageProvider } from '../agent/providers/base'
 import { GeminiProvider } from '../agent/providers/gemini.provider'
 import { SeedreamProvider } from '../agent/providers/seedream.provider'
@@ -14,13 +21,16 @@ import {
   getEvaluationTemplateById,
   ensureDefaultEvaluationTemplate,
   buildDefaultEvalRubric,
+  updateTaskFailed,
 } from '../db/queries'
 import { v4 as uuidv4 } from 'uuid'
 import { createAgentEngine } from '../agent/engines'
+import { formatAuthFailureDetail, parseAuthFailure } from '../agent/auth-error-utils'
 
 const controllers = new Map<string, AbortController>()
 const vlmBridge = new VLMEvalBridge()
 let vlmStarted = false
+let vlmStartSignature: string | null = null
 
 const DEFAULT_AGENT_MAX_RETRIES = 3
 const MIN_AGENT_MAX_RETRIES = 0
@@ -33,6 +43,14 @@ const DEFAULT_RETENTION_RATIO = 0.3
 const DEFAULT_COMPRESSION_SOFT = 70
 const DEFAULT_COMPRESSION_HARD = 85
 const DEFAULT_COMPRESSION_CRITICAL = 92
+const DEFAULT_PROVIDER_PREFLIGHT_ENABLED = false
+const DEFAULT_EVAL_BACKEND: EvaluationBackendName = 'custom_anthropic'
+const DEFAULT_VLMEVAL_USE_CUSTOM_MODEL = true
+
+function fingerprintConfigValue(value: string | undefined): string | null {
+  if (!value) return null
+  return Buffer.from(value, 'utf8').toString('base64')
+}
 
 function parseAgentMaxRetries(rawValue: string | undefined): number {
   if (!rawValue) return DEFAULT_AGENT_MAX_RETRIES
@@ -70,6 +88,25 @@ function parseCompressionThreshold(rawValue: string | undefined, fallback: numbe
   return Math.min(99, Math.max(1, parsed))
 }
 
+function parseProviderPreflightEnabled(rawValue: string | undefined): boolean {
+  if (!rawValue) return DEFAULT_PROVIDER_PREFLIGHT_ENABLED
+  const normalized = rawValue.trim().toLowerCase()
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on'
+}
+
+function parseBooleanFlag(rawValue: string | undefined, fallback: boolean): boolean {
+  if (!rawValue) return fallback
+  const normalized = rawValue.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  return fallback
+}
+
+function parseEvaluationBackend(rawValue: string | undefined): EvaluationBackendName {
+  if (!rawValue) return DEFAULT_EVAL_BACKEND
+  return rawValue.trim() === 'vlmevalkit' ? 'vlmevalkit' : DEFAULT_EVAL_BACKEND
+}
+
 function resolvePythonPath(): string {
   const appPath = app.getAppPath()
   const venvPython =
@@ -97,6 +134,20 @@ async function getOptionalDecryptedValue(key: string): Promise<string | undefine
   if (!encrypted) return undefined
   const value = safeStorage.decryptString(Buffer.from(encrypted, 'base64')).trim()
   return value.length > 0 ? value : undefined
+}
+
+async function getPreferredJudgeValue(
+  judgeKey: string,
+  legacyAnthropicKey: string,
+): Promise<string | undefined> {
+  return (
+    (await getOptionalDecryptedValue(judgeKey)) ??
+    (await getOptionalDecryptedValue(legacyAnthropicKey))
+  )
+}
+
+async function getPreferredJudgeApiKey(): Promise<string | undefined> {
+  return getPreferredJudgeValue('JUDGE_API_KEY', 'ANTHROPIC_API_KEY')
 }
 
 async function createImageProvider(): Promise<ImageProvider> {
@@ -133,6 +184,42 @@ async function createImageProvider(): Promise<ImageProvider> {
       const baseUrl = await getOptionalDecryptedValue('GOOGLE_BASE_URL')
       const imageModel = await getOptionalDecryptedValue('GOOGLE_IMAGE_MODEL')
       return new GeminiProvider({ apiKey, baseUrl, imageModel })
+    }
+  }
+}
+
+async function runProviderPreflight(provider: ImageProvider): Promise<{ success: boolean; message: string }> {
+  try {
+    const generated = await provider.generate({
+      prompt: 'Generate a plain white square image for provider preflight check.',
+      productImagePaths: [],
+      aspectRatio: '1:1',
+    })
+    if (generated.imagePath) {
+      await fsPromises.unlink(generated.imagePath).catch(() => {
+        // Ignore cleanup errors for debug preflight artifacts.
+      })
+    }
+    const mode = generated.debugInfo?.providerMode ?? 'default'
+    return {
+      success: true,
+      message: `Provider preflight succeeded. provider=${provider.name}, mode=${mode}`,
+    }
+  } catch (error: unknown) {
+    const parsedAuth = parseAuthFailure(error, {
+      providerHint: provider.name,
+      tool: 'generate_image',
+    })
+    if (parsedAuth) {
+      return {
+        success: false,
+        message: `Provider preflight failed with auth/permission error. ${formatAuthFailureDetail(parsedAuth)}`,
+      }
+    }
+    const rawError = error instanceof Error ? error.message : String(error)
+    return {
+      success: false,
+      message: `Provider preflight failed. provider=${provider.name}, error=${rawError}`,
     }
   }
 }
@@ -176,6 +263,57 @@ async function resolveEvaluationTemplate(input: TaskInput): Promise<{
   }
 }
 
+async function resolveVLMEvalStartConfig(): Promise<{
+  options: {
+    judgeApiKey?: string
+    judgeBaseUrl?: string
+    judgeModel?: string
+    evalBackend: EvaluationBackendName
+    vlmevalModelId?: string
+    vlmevalUseCustomModel: boolean
+  }
+  signature: string
+}> {
+  const evalBackend = parseEvaluationBackend(await getOptionalDecryptedValue('EVAL_BACKEND'))
+  const judgeApiKey = await getPreferredJudgeApiKey()
+  const judgeBaseUrl = await getPreferredJudgeValue('JUDGE_BASE_URL', 'ANTHROPIC_BASE_URL')
+  const judgeModel = await getPreferredJudgeValue('JUDGE_MODEL', 'ANTHROPIC_MODEL')
+  const vlmevalUseCustomModel = parseBooleanFlag(
+    await getOptionalDecryptedValue('VLMEVAL_USE_CUSTOM_MODEL'),
+    DEFAULT_VLMEVAL_USE_CUSTOM_MODEL,
+  )
+  const vlmevalModelId =
+    await getOptionalDecryptedValue('VLMEVAL_MODEL_ID') ||
+    judgeModel ||
+    'claude-sonnet-4-20250514'
+  if ((evalBackend === 'custom_anthropic' || vlmevalUseCustomModel) && !judgeApiKey) {
+    throw new Error(
+      '视觉评测 Judge 缺少可用的 API Key，请先配置 JUDGE_API_KEY；若沿用旧配置，也可保留 ANTHROPIC_API_KEY 作为回退。',
+    )
+  }
+
+  const options = {
+    judgeApiKey,
+    judgeBaseUrl,
+    judgeModel,
+    evalBackend,
+    vlmevalModelId,
+    vlmevalUseCustomModel,
+  }
+
+  return {
+    options,
+    signature: JSON.stringify({
+      evalBackend,
+      judgeApiKeyFingerprint: fingerprintConfigValue(judgeApiKey),
+      judgeBaseUrl: judgeBaseUrl ?? null,
+      judgeModel: judgeModel ?? null,
+      vlmevalModelId: vlmevalModelId ?? null,
+      vlmevalUseCustomModel,
+    }),
+  }
+}
+
 export function registerAgentHandlers(win: BrowserWindow): void {
   ipcMain.handle(IPC_CHANNELS.TASK_START, async (_event, input: TaskInput): Promise<{ taskId: string }> => {
     const engineName = parseEngineName(await getOptionalDecryptedValue('AGENT_ENGINE'))
@@ -186,16 +324,20 @@ export function registerAgentHandlers(win: BrowserWindow): void {
       throw new Error('配置项 CODEX_API_KEY 未设置，请先在 Settings 页面配置')
     }
 
+    const pythonPath = resolvePythonPath()
+    const vlmevalStartConfig = await resolveVLMEvalStartConfig()
     if (!vlmStarted) {
-      const pythonPath = resolvePythonPath()
-      const anthropicKey = await getDecryptedKey('ANTHROPIC_API_KEY')
-      const anthropicBaseUrl = await getOptionalDecryptedValue('ANTHROPIC_BASE_URL')
-      const anthropicModel = await getOptionalDecryptedValue('ANTHROPIC_MODEL')
-      await vlmBridge.start(pythonPath, anthropicKey, {
-        anthropicBaseUrl,
-        anthropicModel,
-      })
+      await vlmBridge.start(pythonPath, vlmevalStartConfig.options)
       vlmStarted = true
+      vlmStartSignature = vlmevalStartConfig.signature
+    } else if (vlmStartSignature !== vlmevalStartConfig.signature) {
+      if (controllers.size > 0) {
+        throw new Error('视觉评估配置已变更，请等待当前任务完成后再启动新任务。')
+      }
+      await vlmBridge.stop()
+      await vlmBridge.start(pythonPath, vlmevalStartConfig.options)
+      vlmStarted = true
+      vlmStartSignature = vlmevalStartConfig.signature
     }
 
     const taskId = uuidv4()
@@ -216,6 +358,9 @@ export function registerAgentHandlers(win: BrowserWindow): void {
     const anthropicModel = await getOptionalDecryptedValue('ANTHROPIC_MODEL')
 
     const maxRetries = parseAgentMaxRetries(await getOptionalDecryptedValue('AGENT_MAX_RETRIES'))
+    const providerPreflightEnabled = parseProviderPreflightEnabled(
+      await getOptionalDecryptedValue('AGENT_DEBUG_PROVIDER_PREFLIGHT'),
+    )
     const scoreThresholdFromConfig = parseAgentScoreThreshold(
       await getOptionalDecryptedValue('AGENT_SCORE_THRESHOLD'),
     )
@@ -246,6 +391,48 @@ export function registerAgentHandlers(win: BrowserWindow): void {
       scoreThresholdFromConfig ??
       Math.max(0, Math.min(100, evalTemplate.template.default_threshold))
 
+    if (providerPreflightEnabled) {
+      if (!win.isDestroyed()) {
+        win.webContents.send(IPC_CHANNELS.AGENT_LOOP_EVENT, {
+          taskId,
+          phase: 'observe',
+          message: `Provider preflight start. provider=${provider.name}`,
+          retryCount: 0,
+          roundIndex: 0,
+          timestamp: Date.now(),
+        })
+      }
+
+      const preflightResult = await runProviderPreflight(provider)
+      if (!preflightResult.success) {
+        if (!win.isDestroyed()) {
+          win.webContents.send(IPC_CHANNELS.AGENT_LOOP_EVENT, {
+            taskId,
+            phase: 'failed',
+            message: preflightResult.message,
+            retryCount: 0,
+            roundIndex: 0,
+            timestamp: Date.now(),
+          })
+        }
+        await updateTaskFailed({ taskId, retryCount: 0, costUsd: 0 })
+        controller.abort()
+        controllers.delete(taskId)
+        return { taskId }
+      }
+
+      if (!win.isDestroyed()) {
+        win.webContents.send(IPC_CHANNELS.AGENT_LOOP_EVENT, {
+          taskId,
+          phase: 'observe',
+          message: preflightResult.message,
+          retryCount: 0,
+          roundIndex: 0,
+          timestamp: Date.now(),
+        })
+      }
+    }
+
     const engine = createAgentEngine(engineName)
 
     engine
@@ -256,6 +443,7 @@ export function registerAgentHandlers(win: BrowserWindow): void {
         controller.signal,
         {
           provider,
+          providerPreflightEnabled,
           anthropicApiKey: anthropicKey,
           anthropicBaseUrl,
           anthropicModel,
@@ -297,5 +485,7 @@ export function cleanupAgentHandlers(): void {
     ctrl.abort()
   }
   controllers.clear()
+  vlmStarted = false
+  vlmStartSignature = null
   vlmBridge.stop().catch(console.error)
 }

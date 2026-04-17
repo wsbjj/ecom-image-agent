@@ -50,6 +50,7 @@ export interface ImageAsset {
 
 export type ImageProviderName = 'gemini' | 'seedream'
 export type AgentEngineName = 'claude_sdk' | 'codex_sdk' | 'legacy'
+export type EvaluationBackendName = 'custom_anthropic' | 'vlmevalkit'
 
 export interface TaskInput {
   skuId: string

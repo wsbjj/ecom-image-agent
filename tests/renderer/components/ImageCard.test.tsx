@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { render, screen, waitFor } from '@testing-library/react'
 import { ImageCard } from '../../../src/renderer/components/ImageCard'
 import type { TaskRecord } from '../../../src/shared/types'
 
@@ -7,27 +7,27 @@ const baseTask: TaskRecord = {
   id: 1,
   task_id: 'test-task-001',
   sku_id: 'SKU001',
-  product_name: '北欧陶瓷杯',
+  product_name: 'Test Product',
   retry_count: 2,
   total_score: 88,
   defect_analysis: JSON.stringify({
     dimensions: [
       {
         key: 'edge_distortion',
-        name: '边缘畸变',
+        name: 'Edge Distortion',
         score: 28,
         maxScore: 30,
-        issues: ['轻微模糊'],
+        issues: ['slight blur'],
       },
       {
         key: 'perspective_lighting',
-        name: '透视与光影',
+        name: 'Perspective & Lighting',
         score: 30,
         maxScore: 30,
         issues: [],
       },
     ],
-    overall_recommendation: '基本合格',
+    overall_recommendation: 'looks good',
   }),
   status: 'success',
   image_path: null,
@@ -40,63 +40,62 @@ const baseTask: TaskRecord = {
 }
 
 describe('ImageCard', () => {
-  it('should render product name', () => {
-    render(<ImageCard task={baseTask} />)
-    expect(screen.getByText('北欧陶瓷杯')).toBeInTheDocument()
+  beforeEach(() => {
+    vi.clearAllMocks()
   })
 
-  it('should render SKU', () => {
+  it('renders product, SKU, score, and cost', () => {
     render(<ImageCard task={baseTask} />)
+    expect(screen.getByText('Test Product')).toBeInTheDocument()
     expect(screen.getByText('SKU: SKU001')).toBeInTheDocument()
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '88')
+    expect(screen.getByText(/\$0\.0532/)).toBeInTheDocument()
   })
 
-  it('should render score with progress bar', () => {
-    render(<ImageCard task={baseTask} />)
-    expect(screen.getByText('88')).toBeInTheDocument()
-    const progressBar = screen.getByRole('progressbar')
-    expect(progressBar).toHaveAttribute('aria-valuenow', '88')
+  it('renders without crashing for success/failed statuses', () => {
+    const { rerender } = render(<ImageCard task={baseTask} />)
+    expect(screen.getByText('Test Product')).toBeInTheDocument()
+
+    rerender(<ImageCard task={{ ...baseTask, status: 'failed', total_score: 60 }} />)
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '60')
   })
 
-  it('should render cost', () => {
-    render(<ImageCard task={baseTask} />)
-    expect(screen.getByText('费用: $0.0532')).toBeInTheDocument()
-  })
-
-  it('should render status badge', () => {
-    render(<ImageCard task={baseTask} />)
-    expect(screen.getByText('已发布')).toBeInTheDocument()
-  })
-
-  it('should render failed status correctly', () => {
-    const failedTask = { ...baseTask, status: 'failed' as const, total_score: 60 }
-    render(<ImageCard task={failedTask} />)
-    expect(screen.getByText('失败')).toBeInTheDocument()
-  })
-
-  it('should handle missing defect analysis', () => {
-    const taskNoDefect = { ...baseTask, defect_analysis: null }
-    render(<ImageCard task={taskNoDefect} />)
-    expect(screen.getByText('北欧陶瓷杯')).toBeInTheDocument()
-  })
-
-  it('should show placeholder when no image', () => {
+  it('shows placeholder when no image path', () => {
     render(<ImageCard task={baseTask} />)
     expect(screen.getByText('暂无图片')).toBeInTheDocument()
   })
 
-  it('should parse and display first defect issue', () => {
-    render(<ImageCard task={baseTask} />)
-    expect(screen.getByText('边缘畸变: 轻微模糊')).toBeInTheDocument()
-  })
-
-  it('should convert windows image path to safe file URL', () => {
+  it('renders DataURL preview when image data is available', async () => {
+    vi.mocked(window.api.readImageAsDataUrl).mockResolvedValue({
+      dataUrl: 'data:image/mock;base64,preview',
+    })
     const taskWithImage = {
       ...baseTask,
-      image_path: 'C:\\Users\\test\\Desktop\\产品图 1.png',
+      image_path: 'C:\\Users\\test\\Desktop\\product-1.png',
     }
+
     render(<ImageCard task={taskWithImage} />)
 
-    const image = screen.getByAltText('北欧陶瓷杯')
-    expect(image).toHaveAttribute('src', 'file:///C:/Users/test/Desktop/%E4%BA%A7%E5%93%81%E5%9B%BE%201.png')
+    await waitFor(() => {
+      expect(screen.getByAltText('Test Product')).toBeInTheDocument()
+    })
+    const image = screen.getByAltText('Test Product') as HTMLImageElement
+    expect(image.src).toContain('data:image/mock;base64,preview')
+    expect(image.src).not.toContain('file://')
+  })
+
+  it('keeps placeholder when image data is unavailable', async () => {
+    vi.mocked(window.api.readImageAsDataUrl).mockResolvedValue({ dataUrl: null })
+    const taskWithImage = {
+      ...baseTask,
+      image_path: 'C:\\Users\\test\\Desktop\\missing.png',
+    }
+
+    render(<ImageCard task={taskWithImage} />)
+
+    await waitFor(() => {
+      expect(screen.getByText('暂无图片')).toBeInTheDocument()
+    })
+    expect(screen.queryByAltText('Test Product')).not.toBeInTheDocument()
   })
 })

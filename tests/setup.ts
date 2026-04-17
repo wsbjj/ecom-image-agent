@@ -11,6 +11,8 @@ const mockApi = {
   checkConfig: vi.fn().mockResolvedValue({ exists: false }),
   getConfigValue: vi.fn().mockResolvedValue({ value: null }),
   testAnthropicConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok' }),
+  fetchAnthropicModels: vi.fn().mockResolvedValue({ success: true, message: 'ok', models: [] }),
+  fetchJudgeModels: vi.fn().mockResolvedValue({ success: true, message: 'ok', models: [] }),
   testCodexConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok' }),
   testImageProviderConnection: vi.fn().mockResolvedValue({ success: true, message: 'ok', durationMs: 100 }),
   getUserDataPath: vi.fn().mockResolvedValue({ path: 'C:/Users/test/AppData/Roaming/ecom-image-agent' }),

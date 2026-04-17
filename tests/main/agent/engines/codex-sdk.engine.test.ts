@@ -645,6 +645,113 @@ describe('CodexSdkAgentEngine', () => {
     expect(payloads.some((item) => item.message?.includes('non-retriable auth/permission error'))).toBe(true)
   })
 
+  it('fails fast on tool-stage 401 without entering fallback', async () => {
+    mockCodexThreadRun.mockResolvedValue({
+      finalResponse: '{"draft_prompt":"hero product shot"}',
+      usage: {
+        input_tokens: 100,
+        cached_input_tokens: 20,
+        output_tokens: 80,
+      },
+      items: [],
+    })
+
+    const callTool = vi.fn(async (name: string) => {
+      if (name === 'generate_image') {
+        throw new Error('AxiosError: Request failed with status code 401, request_id=req-tool-401')
+      }
+      if (name === 'evaluate_image') {
+        return {
+          total_score: 99,
+          defect_analysis: createDefect(),
+        }
+      }
+      throw new Error(`unknown tool ${name}`)
+    })
+    mockCreateMcpServer.mockResolvedValue({ callTool })
+
+    const { win, events } = createWindowCollector()
+    const engine = new CodexSdkAgentEngine()
+    const controller = new AbortController()
+
+    await engine.run(
+      createInput('task-codex-tool-401-fastfail'),
+      win,
+      {} as never,
+      controller.signal,
+      createOptions(2),
+    )
+
+    expect(mockCodexThreadRun).toHaveBeenCalledTimes(1)
+    expect(callTool).toHaveBeenCalledTimes(1)
+    expect(callTool).toHaveBeenNthCalledWith(
+      1,
+      'generate_image',
+      expect.objectContaining({
+        product_name: 'Liquid Bottle',
+      }),
+    )
+    expect(mockUpdateTaskSuccess).not.toHaveBeenCalled()
+    expect(mockUpdateTaskFailed).toHaveBeenCalledTimes(1)
+
+    const payloads = events.map((item) => item.payload as { message?: string })
+    expect(payloads.some((item) => item.message?.includes('from tool'))).toBe(true)
+    expect(payloads.some((item) => item.message?.includes('status=401'))).toBe(true)
+    expect(payloads.some((item) => item.message?.includes('Last round fallback start.'))).toBe(false)
+  })
+
+  it('fails fast on evaluate_image model/input compatibility error without retrying new rounds', async () => {
+    mockCodexThreadRun.mockResolvedValue({
+      finalResponse: '{"draft_prompt":"hero product shot"}',
+      usage: {
+        input_tokens: 100,
+        cached_input_tokens: 20,
+        output_tokens: 80,
+      },
+      items: [],
+    })
+
+    const callTool = vi.fn(async (name: string) => {
+      if (name === 'generate_image') {
+        return {
+          image_path: '/tmp/original-generated.png',
+          prompt_used: 'x',
+        }
+      }
+      if (name === 'evaluate_image') {
+        throw new Error(
+          "Error code: 400 - {'error': {'code': 'invalid_argument', 'message': 'Invalid content type. image_url is only supported by certain models', 'type': 'invalid_request_error'}, 'id': 'as-test-model-cap'}",
+        )
+      }
+      throw new Error(`unknown tool ${name}`)
+    })
+    mockCreateMcpServer.mockResolvedValue({ callTool })
+
+    const { win, events } = createWindowCollector()
+    const engine = new CodexSdkAgentEngine()
+    const controller = new AbortController()
+
+    await engine.run(
+      createInput('task-codex-eval-model-capability-fastfail'),
+      win,
+      {} as never,
+      controller.signal,
+      createOptions(2),
+    )
+
+    expect(mockCodexThreadRun).toHaveBeenCalledTimes(1)
+    expect(callTool).toHaveBeenCalledTimes(2)
+    expect(mockUpdateTaskSuccess).not.toHaveBeenCalled()
+    expect(mockUpdateTaskFailed).toHaveBeenCalledTimes(1)
+
+    const payloads = events.map((item) => item.payload as { phase?: string; message?: string })
+    expect(
+      payloads.some((item) => item.message?.includes('non-retriable model/input compatibility error')),
+    ).toBe(true)
+    expect(payloads.some((item) => item.message?.includes('Last round fallback start.'))).toBe(false)
+    expect(payloads.filter((item) => item.message?.includes('Round 1 started with Codex SDK.'))).toHaveLength(1)
+  })
+
   it('marks task as failed when signal is aborted before first round', async () => {
     mockCodexThreadRun.mockResolvedValue({
       finalResponse: '{"draft_prompt":"unused"}',

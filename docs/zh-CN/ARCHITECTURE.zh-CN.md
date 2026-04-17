@@ -40,14 +40,30 @@
 ### Python 服务（`python/vlmeval_server.py`）
 
 - 基于 stdin/stdout 的常驻 JSONL 服务
-- 负责视觉评估（Anthropic 模型）
+- 负责视觉评估（`custom_anthropic` / `vlmevalkit` 双后端）
+- Judge 配置优先读取 `JUDGE_*`，缺失时回退到 `ANTHROPIC_*`
+- `vlmevalkit` 模式下支持：
+  - 项目内置自定义 Anthropic adapter
+  - 直接读取 `vlmeval.config.supported_VLM` 的 registry model
 
 ## 核心数据流
 
 ### 任务启动
 
 - 渲染层调用 `TASK_START`
-- 主进程解密配置密钥，按需启动 Python 桥，插入任务记录并异步启动 Agent 循环
+- 主进程分别解析：
+  - Agent 侧 `ANTHROPIC_*` / `CODEX_*`
+  - Judge 侧 `JUDGE_*`，若缺失则回退到 `ANTHROPIC_*`
+- 主进程按需启动 Python 桥，插入任务记录并异步启动 Agent 循环
+
+### 配置职责
+
+- `ANTHROPIC_*`
+  - 仅用于 `claude_sdk` 编排、Anthropic draft fallback、评估模板 AI 草稿
+- `JUDGE_*`
+  - 仅用于 `evaluate_image` 视觉评测
+- `VLMEVAL_MODEL_ID` / `VLMEVAL_USE_CUSTOM_MODEL`
+  - 仅在 `EVAL_BACKEND=vlmevalkit` 时生效
 
 ### Agent 循环（`src/main/agent/runner.ts`）
 

@@ -6,7 +6,26 @@ import { ImageUploadZone } from '../components/ImageUploadZone'
 import { useAgentStore, type RoundPreviewItem } from '../store/agent.store'
 import { startTask, stopTask } from '../lib/ipc'
 import type { TaskInput, ImageAsset, EvaluationTemplateRecord } from '../../shared/types'
-import { toFileUrl } from '../lib/fileUrl'
+
+const TASKRUN_LAST_INPUT_KEY = 'TASKRUN_LAST_INPUT_V1'
+const TASKRUN_LAST_INPUT_VERSION = 'taskrun_last_input_v1'
+
+interface TaskRunQuickSnapshotInput {
+  skuId: string
+  productName: string
+  context: string
+  productImages: ImageAsset[]
+  referenceImages: ImageAsset[]
+  userPrompt: string
+  evaluationTemplateId: number | null
+  scoreThresholdOverrideInput: string
+}
+
+interface TaskRunQuickSnapshotV1 {
+  version: typeof TASKRUN_LAST_INPUT_VERSION
+  savedAt: number
+  input: TaskRunQuickSnapshotInput
+}
 
 function parseOptionalThreshold(rawValue: string): number | undefined {
   const trimmed = rawValue.trim()
@@ -76,6 +95,80 @@ function parseLatestContextUsage(
   return null
 }
 
+function normalizeImageAsset(raw: unknown): ImageAsset | null {
+  if (!raw || typeof raw !== 'object') return null
+  const candidate = raw as {
+    path?: unknown
+    angle?: unknown
+    isPrimary?: unknown
+  }
+  const path = typeof candidate.path === 'string' ? candidate.path.trim() : ''
+  if (!path) return null
+  return {
+    path,
+    angle: typeof candidate.angle === 'string' ? candidate.angle : undefined,
+    isPrimary: typeof candidate.isPrimary === 'boolean' ? candidate.isPrimary : undefined,
+  }
+}
+
+function normalizeImageAssetList(raw: unknown): ImageAsset[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((item) => normalizeImageAsset(item))
+    .filter((item): item is ImageAsset => Boolean(item))
+}
+
+function parseTaskRunQuickSnapshot(rawValue: string | null): TaskRunQuickSnapshotV1 | null {
+  if (!rawValue) return null
+  try {
+    const parsed = JSON.parse(rawValue) as {
+      version?: unknown
+      savedAt?: unknown
+      input?: unknown
+    }
+    if (parsed.version !== TASKRUN_LAST_INPUT_VERSION) {
+      return null
+    }
+    if (!parsed.input || typeof parsed.input !== 'object') {
+      return null
+    }
+
+    const input = parsed.input as {
+      skuId?: unknown
+      productName?: unknown
+      context?: unknown
+      productImages?: unknown
+      referenceImages?: unknown
+      userPrompt?: unknown
+      evaluationTemplateId?: unknown
+      scoreThresholdOverrideInput?: unknown
+    }
+
+    return {
+      version: TASKRUN_LAST_INPUT_VERSION,
+      savedAt: typeof parsed.savedAt === 'number' ? parsed.savedAt : Date.now(),
+      input: {
+        skuId: typeof input.skuId === 'string' ? input.skuId : '',
+        productName: typeof input.productName === 'string' ? input.productName : '',
+        context: typeof input.context === 'string' ? input.context : '',
+        productImages: normalizeImageAssetList(input.productImages),
+        referenceImages: normalizeImageAssetList(input.referenceImages),
+        userPrompt: typeof input.userPrompt === 'string' ? input.userPrompt : '',
+        evaluationTemplateId:
+          typeof input.evaluationTemplateId === 'number' && Number.isInteger(input.evaluationTemplateId)
+            ? input.evaluationTemplateId
+            : null,
+        scoreThresholdOverrideInput:
+          typeof input.scoreThresholdOverrideInput === 'string'
+            ? input.scoreThresholdOverrideInput
+            : '',
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
 export function TaskRun() {
   const {
     activeTaskId,
@@ -103,6 +196,8 @@ export function TaskRun() {
   const [evaluationTemplateId, setEvaluationTemplateId] = useState<number | null>(null)
   const [isBatch, setIsBatch] = useState(false)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [quickLoadMessage, setQuickLoadMessage] = useState<string | null>(null)
+  const [isLoadingLastInput, setIsLoadingLastInput] = useState(false)
   const [roundPreviewSrcByPath, setRoundPreviewSrcByPath] = useState<Record<string, string>>({})
   const [selectedRoundPreview, setSelectedRoundPreview] = useState<RoundPreviewItem | null>(null)
   const loadingRoundPreviewPathsRef = useRef<Set<string>>(new Set())
@@ -240,7 +335,7 @@ export function TaskRun() {
     (rawPath: string | null | undefined): string => {
       const normalizedPath = rawPath?.trim()
       if (!normalizedPath) return ''
-      return roundPreviewSrcByPath[normalizedPath] ?? toFileUrl(normalizedPath)
+      return roundPreviewSrcByPath[normalizedPath] ?? ''
     },
     [roundPreviewSrcByPath],
   )
@@ -275,6 +370,86 @@ export function TaskRun() {
     }
   }, [selectedRoundPreview])
 
+  const filterValidImageAssets = useCallback(async (assets: ImageAsset[]) => {
+    const normalized = assets
+      .map((item) => ({
+        ...item,
+        path: typeof item.path === 'string' ? item.path.trim() : '',
+      }))
+      .filter((item) => item.path.length > 0)
+
+    const checks = await Promise.all(
+      normalized.map(async (asset) => {
+        try {
+          const result = await window.api.readImageAsDataUrl(asset.path)
+          return { asset, valid: Boolean(result.dataUrl) }
+        } catch {
+          return { asset, valid: false }
+        }
+      }),
+    )
+
+    const validAssets = checks.filter((item) => item.valid).map((item) => item.asset)
+    return {
+      validAssets,
+      invalidCount: normalized.length - validAssets.length,
+    }
+  }, [])
+
+  const handleLoadLastInput = useCallback(async () => {
+    setErrorMessage(null)
+    setQuickLoadMessage(null)
+    setIsLoadingLastInput(true)
+    try {
+      const config = await window.api.getConfigValue(TASKRUN_LAST_INPUT_KEY)
+      const snapshot = parseTaskRunQuickSnapshot(config.value)
+      if (!snapshot) {
+        setErrorMessage('暂无可用的上次任务输入')
+        return
+      }
+
+      const [productValidation, referenceValidation] = await Promise.all([
+        filterValidImageAssets(snapshot.input.productImages),
+        filterValidImageAssets(snapshot.input.referenceImages),
+      ])
+
+      setSkuId(snapshot.input.skuId)
+      setProductName(snapshot.input.productName)
+      setContext(snapshot.input.context)
+      setProductImages(productValidation.validAssets)
+      setReferenceImages(referenceValidation.validAssets)
+      setUserPrompt(snapshot.input.userPrompt)
+      setScoreThresholdOverrideInput(snapshot.input.scoreThresholdOverrideInput)
+
+      const templateExists =
+        snapshot.input.evaluationTemplateId !== null &&
+        evalTemplates.some((item) => item.id === snapshot.input.evaluationTemplateId)
+      const fallbackTemplateId = evalTemplates[0]?.id ?? null
+      setEvaluationTemplateId(
+        templateExists ? snapshot.input.evaluationTemplateId : fallbackTemplateId,
+      )
+
+      const messageSegments: string[] = ['已载入上次任务输入，可手动确认后开始生成。']
+      if (productValidation.invalidCount > 0 || referenceValidation.invalidCount > 0) {
+        messageSegments.push(
+          `已自动移除失效图片：商品图 ${productValidation.invalidCount} 张，参考图 ${referenceValidation.invalidCount} 张。`,
+        )
+      }
+      if (snapshot.input.evaluationTemplateId !== null && !templateExists) {
+        messageSegments.push('原评估模板不存在，已自动切换为当前可用模板。')
+      }
+      if (productValidation.validAssets.length === 0) {
+        messageSegments.push('商品图已清空，请重新上传后再启动任务。')
+      }
+      setQuickLoadMessage(messageSegments.join(' '))
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : '载入上次任务输入失败，请稍后重试'
+      setErrorMessage(message)
+    } finally {
+      setIsLoadingLastInput(false)
+    }
+  }, [evalTemplates, filterValidImageAssets])
+
   const handleStart = useCallback(async () => {
     if (!productName.trim() || !skuId.trim()) {
       setErrorMessage('请输入 SKU 和商品名称')
@@ -301,14 +476,37 @@ export function TaskRun() {
 
     try {
       setErrorMessage(null)
+      setQuickLoadMessage(null)
+
+      const snapshotInput: TaskRunQuickSnapshotInput = {
+        skuId: skuId.trim(),
+        productName: productName.trim(),
+        context: context.trim(),
+        productImages: validProductImages,
+        referenceImages: validReferenceImages,
+        userPrompt: userPrompt.trim(),
+        evaluationTemplateId,
+        scoreThresholdOverrideInput: scoreThresholdOverrideInput.trim(),
+      }
+      const snapshotPayload: TaskRunQuickSnapshotV1 = {
+        version: TASKRUN_LAST_INPUT_VERSION,
+        savedAt: Date.now(),
+        input: snapshotInput,
+      }
+      try {
+        await window.api.saveConfig(TASKRUN_LAST_INPUT_KEY, JSON.stringify(snapshotPayload))
+      } catch (persistError) {
+        console.error('[TaskRun] save last input snapshot failed:', persistError)
+      }
+
       const taskId = await startTask({
-        skuId,
-        productName,
-        context,
+        skuId: snapshotInput.skuId,
+        productName: snapshotInput.productName,
+        context: snapshotInput.context,
         templateId: 1,
         productImages: validProductImages,
         referenceImages: validReferenceImages.length > 0 ? validReferenceImages : undefined,
-        userPrompt: userPrompt.trim() || undefined,
+        userPrompt: snapshotInput.userPrompt || undefined,
         evaluationTemplateId,
         scoreThresholdOverride,
       })
@@ -359,6 +557,11 @@ export function TaskRun() {
 
   const usagePercent = contextUsage ? contextUsage.percentage.toFixed(1) : '--'
   const usageTokens = contextUsage ? `${contextUsage.totalTokens}/${contextUsage.maxTokens}` : '--'
+  const canStart =
+    Boolean(productName.trim()) &&
+    Boolean(skuId.trim()) &&
+    Boolean(evaluationTemplateId) &&
+    productImages.some((img) => typeof img.path === 'string' && img.path.trim().length > 0)
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
@@ -366,6 +569,16 @@ export function TaskRun() {
         <div className="flex items-center justify-between">
           <h1 className="text-xl font-bold text-gray-100">任务执行</h1>
           <div className="flex gap-2">
+            {!isBatch && (
+              <button
+                onClick={handleLoadLastInput}
+                disabled={isRunning || isLoadingLastInput}
+                data-testid="taskrun-load-last-button"
+                className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-800 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+              >
+                {isLoadingLastInput ? '载入中...' : '载入上次'}
+              </button>
+            )}
             <button
               onClick={() => setIsBatch(!isBatch)}
               className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition-colors"
@@ -380,6 +593,14 @@ export function TaskRun() {
             {errorMessage}
           </div>
         )}
+        {quickLoadMessage && (
+          <div
+            className="rounded-lg border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-sm text-blue-100"
+            data-testid="taskrun-quickload-message"
+          >
+            {quickLoadMessage}
+          </div>
+        )}
 
         {isBatch ? (
           <CsvImporter onImport={handleBatchImport} />
@@ -392,6 +613,7 @@ export function TaskRun() {
                   value={skuId}
                   onChange={(e) => setSkuId(e.target.value)}
                   placeholder="SKU001"
+                  data-testid="taskrun-sku-input"
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
                 />
               </div>
@@ -401,6 +623,7 @@ export function TaskRun() {
                   value={productName}
                   onChange={(e) => setProductName(e.target.value)}
                   placeholder="北欧陶瓷杯"
+                  data-testid="taskrun-product-name-input"
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
                 />
               </div>
@@ -410,6 +633,7 @@ export function TaskRun() {
                   value={context}
                   onChange={(e) => setContext(e.target.value)}
                   placeholder="侧逆光极简白底场景，柔和阴影"
+                  data-testid="taskrun-context-input"
                   className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
                 />
               </div>
@@ -423,7 +647,8 @@ export function TaskRun() {
               ) : (
                 <button
                   onClick={handleStart}
-                  disabled={!productName.trim() || !skuId.trim()}
+                  disabled={!canStart}
+                  data-testid="taskrun-start-button"
                   className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm font-medium transition-colors whitespace-nowrap"
                 >
                   开始生成
@@ -460,6 +685,7 @@ export function TaskRun() {
                         e.target.value ? Number.parseInt(e.target.value, 10) : null,
                       )
                     }
+                    data-testid="taskrun-eval-template-select"
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
                   >
                     {evalTemplates.map((template) => (
@@ -476,6 +702,7 @@ export function TaskRun() {
                     value={scoreThresholdOverrideInput}
                     onChange={(e) => setScoreThresholdOverrideInput(e.target.value)}
                     placeholder={`默认 ${scoreThreshold}`}
+                    data-testid="taskrun-threshold-override-input"
                     className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
                   />
                 </div>
@@ -494,6 +721,7 @@ export function TaskRun() {
                   onChange={(e) => setUserPrompt(e.target.value)}
                   placeholder="输入补充提示词，例如材质、氛围、构图偏好..."
                   rows={3}
+                  data-testid="taskrun-user-prompt-input"
                   className="w-full min-h-[72px] bg-gray-800/35 border border-dashed border-gray-700 rounded-lg px-3 py-2 text-sm resize-y focus:border-blue-500 focus:outline-none placeholder:text-gray-600"
                 />
               </div>
@@ -523,17 +751,20 @@ export function TaskRun() {
                     className="group w-36 sm:w-40 rounded-md border border-gray-700/60 overflow-hidden text-left bg-gray-900/40 hover:border-gray-500/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/70 transition-colors"
                     onClick={() => setSelectedRoundPreview(item)}
                   >
-                    <img
-                      src={resolveRoundItemPreviewSrc(item)}
-                      alt={`round-${item.roundIndex + 1}`}
-                      className="w-full h-24 sm:h-28 object-cover transition-transform duration-200 group-hover:scale-[1.02]"
-                      onError={(event) => {
-                        const fallbackSrc = resolveRoundPreviewSrc(item.generatedImagePath)
-                        if (fallbackSrc && event.currentTarget.src !== fallbackSrc) {
-                          event.currentTarget.src = fallbackSrc
-                        }
-                      }}
-                    />
+                    {resolveRoundItemPreviewSrc(item) ? (
+                      <img
+                        src={resolveRoundItemPreviewSrc(item)}
+                        alt={`round-${item.roundIndex + 1}`}
+                        className="w-full h-24 sm:h-28 object-cover transition-transform duration-200 group-hover:scale-[1.02]"
+                      />
+                    ) : (
+                      <div
+                        className="w-full h-24 sm:h-28 flex items-center justify-center text-[11px] text-gray-500 bg-gray-950/60"
+                        data-testid={`round-preview-placeholder-${item.roundIndex}`}
+                      >
+                        预览加载中
+                      </div>
+                    )}
                     <div className="px-2 py-1.5 text-[11px] bg-gray-900/80 text-gray-300 flex justify-between">
                       <span>第 {item.roundIndex + 1} 轮</span>
                       <span>{item.score !== null ? `${item.score}` : '--'}</span>
@@ -630,17 +861,20 @@ export function TaskRun() {
             </div>
 
             <div className="rounded-lg bg-black/40 p-2 flex items-center justify-center">
-              <img
-                src={resolveRoundItemPreviewSrc(selectedRoundPreview)}
-                alt={`round-${selectedRoundPreview.roundIndex + 1}-full`}
-                className="max-h-[80vh] w-auto max-w-full object-contain rounded-md"
-                onError={(event) => {
-                  const fallbackSrc = resolveRoundPreviewSrc(selectedRoundPreview.generatedImagePath)
-                  if (fallbackSrc && event.currentTarget.src !== fallbackSrc) {
-                    event.currentTarget.src = fallbackSrc
-                  }
-                }}
-              />
+              {resolveRoundItemPreviewSrc(selectedRoundPreview) ? (
+                <img
+                  src={resolveRoundItemPreviewSrc(selectedRoundPreview)}
+                  alt={`round-${selectedRoundPreview.roundIndex + 1}-full`}
+                  className="max-h-[80vh] w-auto max-w-full object-contain rounded-md"
+                />
+              ) : (
+                <div
+                  className="h-[50vh] w-full flex items-center justify-center text-sm text-gray-500"
+                  data-testid="round-preview-overlay-placeholder"
+                >
+                  预览加载中
+                </div>
+              )}
             </div>
           </div>
         </div>

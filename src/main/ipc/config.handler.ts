@@ -103,6 +103,49 @@ function extractAnthropicText(
   return textBlocks.join('\n').trim()
 }
 
+async function listAnthropicModelOptions(client: Anthropic): Promise<Array<{ id: string; displayName: string }>> {
+  const models: Array<{ id: string; displayName: string }> = []
+  const seen = new Set<string>()
+
+  for await (const model of client.models.list({ limit: 100 })) {
+    const id = typeof model.id === 'string' ? model.id.trim() : ''
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    models.push({
+      id,
+      displayName:
+        typeof model.display_name === 'string' && model.display_name.trim().length > 0
+          ? model.display_name.trim()
+          : id,
+    })
+  }
+
+  return models
+}
+
+async function getFirstConfiguredValue(keys: string[]): Promise<string | undefined> {
+  for (const key of keys) {
+    const value = await getOptionalDecryptedValue(key)
+    if (value) {
+      return value
+    }
+  }
+  return undefined
+}
+
+async function resolveModelFetchConfig(
+  params: { apiKey?: string; baseUrl?: string },
+  fallbackKeys: {
+    apiKeyKeys: string[]
+    baseUrlKeys: string[]
+  },
+): Promise<{ apiKey?: string; baseUrl?: string }> {
+  return {
+    apiKey: params.apiKey?.trim() || (await getFirstConfiguredValue(fallbackKeys.apiKeyKeys)),
+    baseUrl: params.baseUrl?.trim() || (await getFirstConfiguredValue(fallbackKeys.baseUrlKeys)),
+  }
+}
+
 function parseJsonFromModelOutput(rawText: string): unknown {
   const trimmed = rawText.trim()
   if (!trimmed) {
@@ -272,6 +315,100 @@ export function registerConfigHandlers(): void {
   )
 
   ipcMain.handle(
+    IPC_CHANNELS.CONFIG_FETCH_ANTHROPIC_MODELS,
+    async (
+      _event,
+      params: { apiKey?: string; baseUrl?: string },
+    ): Promise<{
+      success: boolean
+      message: string
+      models: Array<{ id: string; displayName: string }>
+    }> => {
+      const { apiKey, baseUrl } = await resolveModelFetchConfig(params, {
+        apiKeyKeys: ['ANTHROPIC_API_KEY'],
+        baseUrlKeys: ['ANTHROPIC_BASE_URL'],
+      })
+
+      if (!apiKey) {
+        return { success: false, message: '请先输入 Anthropic API Key', models: [] }
+      }
+
+      try {
+        const anthropic = new Anthropic({
+          apiKey,
+          ...(baseUrl ? { baseURL: baseUrl } : {}),
+        })
+        const models = await listAnthropicModelOptions(anthropic)
+        if (models.length === 0) {
+          return {
+            success: false,
+            message: '未从当前 Base URL 获取到可用模型列表',
+            models: [],
+          }
+        }
+
+        return {
+          success: true,
+          message: `已获取 ${models.length} 个可用模型`,
+          models,
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { success: false, message, models: [] }
+      }
+    },
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.CONFIG_FETCH_JUDGE_MODELS,
+    async (
+      _event,
+      params: { apiKey?: string; baseUrl?: string },
+    ): Promise<{
+      success: boolean
+      message: string
+      models: Array<{ id: string; displayName: string }>
+    }> => {
+      const { apiKey, baseUrl } = await resolveModelFetchConfig(params, {
+        apiKeyKeys: ['JUDGE_API_KEY', 'ANTHROPIC_API_KEY'],
+        baseUrlKeys: ['JUDGE_BASE_URL', 'ANTHROPIC_BASE_URL'],
+      })
+
+      if (!apiKey) {
+        return {
+          success: false,
+          message: '请先输入 Judge API Key；若未单独配置，也可先保留 ANTHROPIC_API_KEY 作为回退。',
+          models: [],
+        }
+      }
+
+      try {
+        const anthropic = new Anthropic({
+          apiKey,
+          ...(baseUrl ? { baseURL: baseUrl } : {}),
+        })
+        const models = await listAnthropicModelOptions(anthropic)
+        if (models.length === 0) {
+          return {
+            success: false,
+            message: '未从当前 Judge Base URL 获取到可用模型列表',
+            models: [],
+          }
+        }
+
+        return {
+          success: true,
+          message: `已获取 ${models.length} 个可用 Judge 模型`,
+          models,
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return { success: false, message, models: [] }
+      }
+    },
+  )
+
+  ipcMain.handle(
     IPC_CHANNELS.CONFIG_TEST_CODEX,
     async (
       _event,
@@ -405,7 +542,7 @@ export function registerConfigHandlers(): void {
           (await getOptionalDecryptedValue('SEEDREAM_VISUAL_REQ_KEY')) ||
           'high_aes_general_v30l_zt2i'
 
-        if (!apiKey) {
+        if (!apiKey && callMode !== 'visual_official') {
           return { success: false, message: '请先输入 Seedream API Key' }
         }
 
@@ -442,7 +579,7 @@ export function registerConfigHandlers(): void {
         }
 
         const provider = new SeedreamProvider({
-          apiKey,
+          apiKey: apiKey!,
           baseUrl,
           endpointId,
         })

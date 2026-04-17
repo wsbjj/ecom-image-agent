@@ -17,6 +17,12 @@ import {
 import { persistRoundArtifacts, pruneRoundOriginalCache } from '../round-image-cache'
 import type { AgentEngine, EngineRuntimeOptions } from './types'
 import { buildEnforcedGenerationPrompt, buildFallbackDraftPrompt } from '../enforced-generation-prompt'
+import { formatAuthFailureDetail, parseAuthFailure, type ParsedAuthFailure } from '../auth-error-utils'
+import {
+  formatModelCapabilityFailureDetail,
+  parseModelCapabilityFailure,
+  type ParsedModelCapabilityFailure,
+} from '../nonretriable-error-utils'
 
 const DEFAULT_MODEL = 'gpt-5.4'
 const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-20250514'
@@ -528,6 +534,8 @@ export class CodexSdkAgentEngine implements AgentEngine {
       let lastCodexQueryError: ParsedCodexQueryError | null = null
       let codexTurn: Awaited<ReturnType<typeof thread.run>> | null = null
       let unrecoverableCodexError: string | null = null
+      let unrecoverableToolAuthFailure: ParsedAuthFailure | null = null
+      let unrecoverableToolModelCapabilityFailure: ParsedModelCapabilityFailure | null = null
 
       if (codexGatewayCircuitOpen) {
         pushEvent({
@@ -625,17 +633,17 @@ export class CodexSdkAgentEngine implements AgentEngine {
         }
       } else if (lastCodexQueryError) {
         activeRoundState.queryError = lastCodexQueryError.raw
-        if (lastCodexQueryError.statusCode === 401 || lastCodexQueryError.statusCode === 403) {
-          unrecoverableCodexError =
-            `codex_auth_or_permission_error: status=${lastCodexQueryError.statusCode}` +
-            `, request_id=${lastCodexQueryError.requestId ?? 'unknown'}` +
-            `, url=${lastCodexQueryError.url ?? 'unknown'}`
+        const parsedAuthFailure = parseAuthFailure(lastCodexQueryError.raw, {
+          providerHint: 'codex',
+          tool: null,
+        })
+        if (parsedAuthFailure) {
+          const detail = formatAuthFailureDetail(parsedAuthFailure)
+          unrecoverableCodexError = `codex_auth_or_permission_error: ${detail}`
           pushEvent({
             taskId,
             phase: 'observe',
-            message:
-              `Codex returned non-retriable auth/permission error.` +
-              ` status=${lastCodexQueryError.statusCode}, request_id=${lastCodexQueryError.requestId ?? 'unknown'}`,
+            message: `Codex returned non-retriable auth/permission error. ${detail}`,
             retryCount,
             roundIndex,
             timestamp: Date.now(),
@@ -823,7 +831,24 @@ export class CodexSdkAgentEngine implements AgentEngine {
             timestamp: Date.now(),
           })
         } catch (error: unknown) {
-          activeRoundState.queryError = error instanceof Error ? error.message : String(error)
+          const rawError = error instanceof Error ? error.message : String(error)
+          activeRoundState.queryError = rawError
+          const parsedAuthFailure = parseAuthFailure(rawError, {
+            providerHint: options.provider.name,
+            tool: 'generate_image',
+          })
+          if (parsedAuthFailure) {
+            unrecoverableToolAuthFailure = parsedAuthFailure
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `generate_image failed with non-retriable auth/permission error. ${formatAuthFailureDetail(parsedAuthFailure)}`,
+              retryCount,
+              roundIndex,
+              contextUsage,
+              timestamp: Date.now(),
+            })
+          }
         }
       }
 
@@ -851,6 +876,40 @@ export class CodexSdkAgentEngine implements AgentEngine {
         } catch (error: unknown) {
           const errorMessage = error instanceof Error ? error.message : String(error)
           activeRoundState.queryError = activeRoundState.queryError ?? errorMessage
+          const parsedAuthFailure = parseAuthFailure(errorMessage, {
+            providerHint: 'anthropic',
+            tool: 'evaluate_image',
+          })
+          if (parsedAuthFailure) {
+            unrecoverableToolAuthFailure = parsedAuthFailure
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message: `evaluate_image failed with non-retriable auth/permission error. ${formatAuthFailureDetail(parsedAuthFailure)}`,
+              retryCount,
+              roundIndex,
+              contextUsage,
+              timestamp: Date.now(),
+            })
+          }
+          const parsedModelCapabilityFailure = parseModelCapabilityFailure(errorMessage, {
+            providerHint: 'anthropic',
+            tool: 'evaluate_image',
+          })
+          if (parsedModelCapabilityFailure) {
+            unrecoverableToolModelCapabilityFailure = parsedModelCapabilityFailure
+            pushEvent({
+              taskId,
+              phase: 'observe',
+              message:
+                'evaluate_image failed with non-retriable model/input compatibility error. ' +
+                formatModelCapabilityFailureDetail(parsedModelCapabilityFailure),
+              retryCount,
+              roundIndex,
+              contextUsage,
+              timestamp: Date.now(),
+            })
+          }
         }
       }
 
@@ -878,6 +937,37 @@ export class CodexSdkAgentEngine implements AgentEngine {
           costUsd: totalCostUsd,
           timestamp: Date.now(),
         })
+      }
+
+      if (unrecoverableToolAuthFailure) {
+        const detail = formatAuthFailureDetail(unrecoverableToolAuthFailure)
+        pushEvent({
+          taskId,
+          phase: 'observe',
+          message: `Codex detected non-retriable auth/permission error from tool. ${detail}`,
+          retryCount,
+          roundIndex,
+          contextUsage,
+          costUsd: totalCostUsd,
+          timestamp: Date.now(),
+        })
+        terminalFailureReason = `tool_auth_or_permission_error: ${detail}`
+        break
+      }
+      if (unrecoverableToolModelCapabilityFailure) {
+        const detail = formatModelCapabilityFailureDetail(unrecoverableToolModelCapabilityFailure)
+        pushEvent({
+          taskId,
+          phase: 'observe',
+          message: `Codex detected non-retriable model/input compatibility error from tool. ${detail}`,
+          retryCount,
+          roundIndex,
+          contextUsage,
+          costUsd: totalCostUsd,
+          timestamp: Date.now(),
+        })
+        terminalFailureReason = `tool_model_or_capability_error: ${detail}`
+        break
       }
 
       let generatedImagePath = activeRoundState.generatedImagePath

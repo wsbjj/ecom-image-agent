@@ -5,6 +5,7 @@ import type { VLMEvalBridge } from '../vlmeval-bridge'
 
 export interface EngineRuntimeOptions {
   provider: ImageProvider
+  providerPreflightEnabled?: boolean
   anthropicApiKey: string
   anthropicBaseUrl?: string
   anthropicModel?: string

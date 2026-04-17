@@ -52,6 +52,24 @@ const api = {
   }): Promise<{ success: boolean; message: string }> =>
     ipcRenderer.invoke(IPC_CHANNELS.CONFIG_TEST_ANTHROPIC, params),
 
+  fetchAnthropicModels: (params: {
+    apiKey?: string
+    baseUrl?: string
+  }): Promise<{
+    success: boolean
+    message: string
+    models: Array<{ id: string; displayName: string }>
+  }> => ipcRenderer.invoke(IPC_CHANNELS.CONFIG_FETCH_ANTHROPIC_MODELS, params),
+
+  fetchJudgeModels: (params: {
+    apiKey?: string
+    baseUrl?: string
+  }): Promise<{
+    success: boolean
+    message: string
+    models: Array<{ id: string; displayName: string }>
+  }> => ipcRenderer.invoke(IPC_CHANNELS.CONFIG_FETCH_JUDGE_MODELS, params),
+
   testCodexConnection: (params: {
     apiKey?: string
     baseUrl?: string

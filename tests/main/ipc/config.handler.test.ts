@@ -13,8 +13,13 @@ const {
   mockDeleteEvaluationTemplate,
   mockEnsureDefaultEvaluationTemplate,
   mockAnthropicMessagesCreate,
+  mockAnthropicModelsList,
   mockCodexStartThread,
   mockCodexThreadRun,
+  mockSeedreamProviderCtor,
+  mockSeedreamVisualProviderCtor,
+  mockSeedreamProviderGenerate,
+  mockSeedreamVisualGenerate,
 } = vi.hoisted(() => ({
   handlerMap: new Map<string, (...args: unknown[]) => Promise<unknown>>(),
   mockInsertEvaluationTemplate: vi.fn(),
@@ -27,8 +32,13 @@ const {
   mockDeleteEvaluationTemplate: vi.fn(),
   mockEnsureDefaultEvaluationTemplate: vi.fn(),
   mockAnthropicMessagesCreate: vi.fn(),
+  mockAnthropicModelsList: vi.fn(),
   mockCodexStartThread: vi.fn(),
   mockCodexThreadRun: vi.fn(),
+  mockSeedreamProviderCtor: vi.fn(),
+  mockSeedreamVisualProviderCtor: vi.fn(),
+  mockSeedreamProviderGenerate: vi.fn(),
+  mockSeedreamVisualGenerate: vi.fn(),
 }))
 
 vi.mock('electron', () => ({
@@ -51,6 +61,9 @@ vi.mock('@anthropic-ai/sdk', () => ({
     messages: {
       create: mockAnthropicMessagesCreate,
     },
+    models: {
+      list: mockAnthropicModelsList,
+    },
   })),
 }))
 
@@ -65,11 +78,15 @@ vi.mock('@google/generative-ai', () => ({
 }))
 
 vi.mock('../../../src/main/agent/providers/seedream.provider', () => ({
-  SeedreamProvider: vi.fn(),
+  SeedreamProvider: mockSeedreamProviderCtor.mockImplementation(() => ({
+    generate: mockSeedreamProviderGenerate,
+  })),
 }))
 
 vi.mock('../../../src/main/agent/providers/seedream-visual.provider', () => ({
-  SeedreamVisualProvider: vi.fn(),
+  SeedreamVisualProvider: mockSeedreamVisualProviderCtor.mockImplementation(() => ({
+    generate: mockSeedreamVisualGenerate,
+  })),
 }))
 
 vi.mock('../../../src/main/db/queries', () => ({
@@ -100,6 +117,16 @@ const VALID_MARKDOWN = `
 
 function encodeStoredValue(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64')
+}
+
+function createAsyncIterable<T>(items: T[]): AsyncIterable<T> {
+  return {
+    async *[Symbol.asyncIterator](): AsyncGenerator<T> {
+      for (const item of items) {
+        yield item
+      }
+    },
+  }
 }
 
 describe('registerConfigHandlers eval-template:save', () => {
@@ -392,5 +419,193 @@ describe('registerConfigHandlers config:test-codex', () => {
     expect(result.message).toMatch(/request_id=req-502-test/i)
     expect(result.message).toMatch(/agent\.cam01\.cn\/v1\/responses/i)
     expect(result.message).toMatch(/official endpoint/i)
+  })
+})
+
+describe('registerConfigHandlers config:fetch-anthropic-models', () => {
+  beforeEach(() => {
+    handlerMap.clear()
+    vi.clearAllMocks()
+    mockGetConfigValue.mockResolvedValue(undefined)
+    mockAnthropicModelsList.mockReset()
+  })
+
+  it('returns clear error when anthropic api key is missing', async () => {
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_FETCH_ANTHROPIC_MODELS)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {})) as {
+      success: boolean
+      message: string
+      models: Array<{ id: string; displayName: string }>
+    }
+
+    expect(result.success).toBe(false)
+    expect(result.message).toMatch(/Anthropic API Key/)
+    expect(result.models).toEqual([])
+    expect(mockAnthropicModelsList).not.toHaveBeenCalled()
+  })
+
+  it('returns normalized model list for explicit anthropic params', async () => {
+    mockAnthropicModelsList.mockReturnValue(
+      createAsyncIterable([
+        {
+          id: 'claude-sonnet-4-20250514',
+          display_name: 'Claude Sonnet 4',
+        },
+        {
+          id: 'claude-opus-4-20250514',
+          display_name: 'Claude Opus 4',
+        },
+      ]),
+    )
+
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_FETCH_ANTHROPIC_MODELS)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {
+      apiKey: 'sk-ant-test',
+      baseUrl: 'https://proxy.example.com',
+    })) as {
+      success: boolean
+      message: string
+      models: Array<{ id: string; displayName: string }>
+    }
+
+    expect(mockAnthropicModelsList).toHaveBeenCalledWith({ limit: 100 })
+    expect(result.success).toBe(true)
+    expect(result.message).toMatch(/已获取 2 个可用模型/)
+    expect(result.models).toEqual([
+      { id: 'claude-sonnet-4-20250514', displayName: 'Claude Sonnet 4' },
+      { id: 'claude-opus-4-20250514', displayName: 'Claude Opus 4' },
+    ])
+  })
+})
+
+describe('registerConfigHandlers config:fetch-judge-models', () => {
+  beforeEach(() => {
+    handlerMap.clear()
+    vi.clearAllMocks()
+    mockGetConfigValue.mockResolvedValue(undefined)
+    mockAnthropicModelsList.mockReset()
+  })
+
+  it('returns clear error when neither judge nor fallback anthropic api key is configured', async () => {
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_FETCH_JUDGE_MODELS)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {})) as {
+      success: boolean
+      message: string
+      models: Array<{ id: string; displayName: string }>
+    }
+
+    expect(result.success).toBe(false)
+    expect(result.message).toMatch(/Judge API Key/i)
+    expect(result.models).toEqual([])
+    expect(mockAnthropicModelsList).not.toHaveBeenCalled()
+  })
+
+  it('uses explicit judge params to fetch model list', async () => {
+    mockAnthropicModelsList.mockReturnValue(
+      createAsyncIterable([
+        {
+          id: 'glm-5',
+          display_name: 'GLM 5',
+        },
+      ]),
+    )
+
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_FETCH_JUDGE_MODELS)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {
+      apiKey: 'judge-key',
+      baseUrl: 'https://judge.example.com',
+    })) as {
+      success: boolean
+      message: string
+      models: Array<{ id: string; displayName: string }>
+    }
+
+    expect(result.success).toBe(true)
+    expect(result.message).toMatch(/Judge 模型/)
+    expect(result.models).toEqual([{ id: 'glm-5', displayName: 'GLM 5' }])
+  })
+
+  it('falls back to anthropic config when judge config is absent', async () => {
+    mockGetConfigValue.mockImplementation(async (key: string) => {
+      if (key === 'ANTHROPIC_API_KEY') return encodeStoredValue('sk-ant-test')
+      if (key === 'ANTHROPIC_BASE_URL') return encodeStoredValue('https://fallback.example.com')
+      return undefined
+    })
+    mockAnthropicModelsList.mockReturnValue(
+      createAsyncIterable([
+        {
+          id: 'glm-5',
+          display_name: 'GLM 5',
+        },
+      ]),
+    )
+
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_FETCH_JUDGE_MODELS)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {})) as {
+      success: boolean
+      message: string
+      models: Array<{ id: string; displayName: string }>
+    }
+
+    expect(result.success).toBe(true)
+    expect(result.models).toEqual([{ id: 'glm-5', displayName: 'GLM 5' }])
+    expect(mockAnthropicModelsList).toHaveBeenCalledWith({ limit: 100 })
+  })
+})
+
+describe('registerConfigHandlers config:test-image-provider', () => {
+  beforeEach(() => {
+    handlerMap.clear()
+    vi.clearAllMocks()
+    mockGetConfigValue.mockResolvedValue(undefined)
+    mockSeedreamProviderGenerate.mockReset()
+    mockSeedreamVisualGenerate.mockReset()
+  })
+
+  it('allows visual_official test without Seedream API key when AK/SK are provided', async () => {
+    mockSeedreamVisualGenerate.mockResolvedValue({
+      imagePath: '/tmp/visual.png',
+      promptUsed: 'test',
+      debugInfo: {
+        providerMode: 'visual_official',
+      },
+    })
+
+    registerConfigHandlers()
+    const handler = handlerMap.get(IPC_CHANNELS.CONFIG_TEST_IMAGE_PROVIDER)
+    expect(handler).toBeTruthy()
+
+    const result = (await handler!({}, {
+      provider: 'seedream',
+      callMode: 'visual_official',
+      accessKeyId: 'ak-test',
+      secretAccessKey: 'sk-test',
+      reqKey: 'high_aes_general_v30l_zt2i',
+      endpointId: 'doubao-seedream-3-0-t2i-250415',
+    })) as {
+      success: boolean
+      message: string
+      durationMs?: number
+    }
+
+    expect(result.success).toBe(true)
+    expect(mockSeedreamVisualProviderCtor).toHaveBeenCalledTimes(1)
+    expect(mockSeedreamProviderCtor).not.toHaveBeenCalled()
+    expect(mockSeedreamVisualGenerate).toHaveBeenCalledTimes(1)
   })
 })

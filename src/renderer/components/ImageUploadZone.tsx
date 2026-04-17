@@ -1,6 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import type { ImageAsset } from '../../shared/types'
-import { toFileUrl } from '../lib/fileUrl'
 
 const ANGLE_OPTIONS = ['front', 'side', 'top', 'detail'] as const
 const ANGLE_LABELS: Record<string, string> = {
@@ -182,7 +181,7 @@ export function ImageUploadZone({
   const resolvePreviewSrc = useCallback(
     (rawPath: string): string => {
       const normalizedPath = rawPath.trim()
-      return previewSrcByPath[normalizedPath] ?? toFileUrl(normalizedPath)
+      return previewSrcByPath[normalizedPath] ?? ''
     },
     [previewSrcByPath],
   )
@@ -228,11 +227,20 @@ export function ImageUploadZone({
           <div className="w-full grid grid-cols-4 gap-2">
             {value.map((asset, i) => (
               <div key={`${asset.path}-${i}`} className="relative group">
-                <img
-                  src={resolvePreviewSrc(asset.path)}
-                  alt={`${label} ${i + 1}`}
-                  className="w-full aspect-square object-cover rounded-md border border-gray-700"
-                />
+                {resolvePreviewSrc(asset.path) ? (
+                  <img
+                    src={resolvePreviewSrc(asset.path)}
+                    alt={`${label} ${i + 1}`}
+                    className="w-full aspect-square object-cover rounded-md border border-gray-700"
+                  />
+                ) : (
+                  <div
+                    className="w-full aspect-square rounded-md border border-gray-700 bg-gray-900/70 flex items-center justify-center text-[10px] text-gray-500"
+                    data-testid={`image-upload-placeholder-${i}`}
+                  >
+                    预览加载中
+                  </div>
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation()

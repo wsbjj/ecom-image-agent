@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useConfigStore } from '../store/config.store'
-import type { ImageProviderName } from '../../shared/types'
+import type { ImageProviderName, EvaluationBackendName } from '../../shared/types'
 
 const DEFAULT_AGENT_MAX_RETRIES = 3
 const MIN_AGENT_MAX_RETRIES = 0
@@ -16,6 +16,33 @@ const MAX_CONTEXT_RETENTION_RATIO = 0.9
 const DEFAULT_CONTEXT_COMPRESSION_SOFT = 70
 const DEFAULT_CONTEXT_COMPRESSION_HARD = 85
 const DEFAULT_CONTEXT_COMPRESSION_CRITICAL = 92
+const DEFAULT_EVAL_BACKEND: EvaluationBackendName = 'custom_anthropic'
+const DEFAULT_VLMEVAL_USE_CUSTOM_MODEL = true
+
+type ModelOption = {
+  id: string
+  displayName: string
+}
+
+function isLikelyNonClaudeModel(rawValue: string): boolean {
+  const value = rawValue.trim().toLowerCase()
+  if (!value) return false
+  if (value.includes('claude')) return false
+  return [
+    'glm',
+    'qwen',
+    'gemini',
+    'gpt',
+    'grok',
+    'doubao',
+    'seed',
+    'moonshot',
+    'kimi',
+    'ernie',
+    'minimax',
+    'yi',
+  ].some((keyword) => value.includes(keyword))
+}
 
 function normalizeAgentMaxRetries(rawValue: string | null): string {
   if (!rawValue) return String(DEFAULT_AGENT_MAX_RETRIES)
@@ -82,6 +109,18 @@ function parseContextCompressionThresholdInput(rawValue: string): number | null 
   return parsed
 }
 
+function normalizeBooleanConfig(rawValue: string | null, fallback: boolean): boolean {
+  if (!rawValue) return fallback
+  const normalized = rawValue.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  return fallback
+}
+
+function normalizeEvaluationBackend(rawValue: string | null): EvaluationBackendName {
+  return rawValue?.trim() === 'vlmevalkit' ? 'vlmevalkit' : DEFAULT_EVAL_BACKEND
+}
+
 export function Settings() {
   const {
     hasAnthropicKey,
@@ -95,6 +134,7 @@ export function Settings() {
   } = useConfigStore()
 
   const [anthropicInput, setAnthropicInput] = useState('')
+  const [judgeInput, setJudgeInput] = useState('')
   const [googleInput, setGoogleInput] = useState('')
   const [seedreamInput, setSeedreamInput] = useState('')
   const [seedreamEndpointId, setSeedreamEndpointId] = useState('')
@@ -105,6 +145,8 @@ export function Settings() {
   const [seedreamVisualReqKey, setSeedreamVisualReqKey] = useState('high_aes_general_v30l_zt2i')
   const [anthropicBaseUrl, setAnthropicBaseUrl] = useState('')
   const [anthropicModel, setAnthropicModel] = useState('')
+  const [judgeBaseUrl, setJudgeBaseUrl] = useState('')
+  const [judgeModel, setJudgeModel] = useState('')
   const [codexInput, setCodexInput] = useState('')
   const [codexBaseUrl, setCodexBaseUrl] = useState('')
   const [codexModel, setCodexModel] = useState(DEFAULT_CODEX_MODEL)
@@ -137,11 +179,28 @@ export function Settings() {
     String(DEFAULT_CONTEXT_COMPRESSION_CRITICAL),
   )
   const [evalTemplateDefaultIdInput, setEvalTemplateDefaultIdInput] = useState('')
+  const [evalBackend, setEvalBackend] = useState<EvaluationBackendName>(DEFAULT_EVAL_BACKEND)
+  const [vlmevalModelId, setVlmevalModelId] = useState('')
+  const [vlmevalUseCustomModel, setVlmevalUseCustomModel] = useState(
+    DEFAULT_VLMEVAL_USE_CUSTOM_MODEL,
+  )
   const [saving, setSaving] = useState(false)
   const [testingAnthropic, setTestingAnthropic] = useState(false)
+  const [fetchingAnthropicModels, setFetchingAnthropicModels] = useState(false)
+  const [fetchingJudgeModels, setFetchingJudgeModels] = useState(false)
   const [testingCodex, setTestingCodex] = useState(false)
   const [testingImageProvider, setTestingImageProvider] = useState<ImageProviderName | null>(null)
+  const [anthropicModelOptions, setAnthropicModelOptions] = useState<ModelOption[]>([])
+  const [judgeModelOptions, setJudgeModelOptions] = useState<ModelOption[]>([])
   const [anthropicTestMessage, setAnthropicTestMessage] = useState<{
+    type: 'success' | 'error'
+    text: string
+  } | null>(null)
+  const [anthropicModelListMessage, setAnthropicModelListMessage] = useState<{
+    type: 'success' | 'error'
+    text: string
+  } | null>(null)
+  const [judgeModelListMessage, setJudgeModelListMessage] = useState<{
     type: 'success' | 'error'
     text: string
   } | null>(null)
@@ -162,12 +221,15 @@ export function Settings() {
     try {
       const [
         anthropicKeyResult,
+        judgeKeyResult,
         googleKeyResult,
         seedreamKeyResult,
         seedreamEndpointResult,
         seedreamBaseUrlResult,
         anthropicBaseUrlResult,
         anthropicModelResult,
+        judgeBaseUrlResult,
+        judgeModelResult,
         codexKeyResult,
         codexBaseUrlResult,
         codexModelResult,
@@ -185,14 +247,20 @@ export function Settings() {
         contextCompressionHardResult,
         contextCompressionCriticalResult,
         evalTemplateDefaultIdResult,
+        evalBackendResult,
+        vlmevalModelIdResult,
+        vlmevalUseCustomModelResult,
       ] = await Promise.all([
         window.api.getConfigValue('ANTHROPIC_API_KEY'),
+        window.api.getConfigValue('JUDGE_API_KEY'),
         window.api.getConfigValue('GOOGLE_API_KEY'),
         window.api.getConfigValue('APIKEY_SEEDREAM'),
         window.api.getConfigValue('SEEDREAM_ENDPOINT_ID'),
         window.api.getConfigValue('SEEDREAM_BASE_URL'),
         window.api.getConfigValue('ANTHROPIC_BASE_URL'),
         window.api.getConfigValue('ANTHROPIC_MODEL'),
+        window.api.getConfigValue('JUDGE_BASE_URL'),
+        window.api.getConfigValue('JUDGE_MODEL'),
         window.api.getConfigValue('CODEX_API_KEY'),
         window.api.getConfigValue('CODEX_BASE_URL'),
         window.api.getConfigValue('CODEX_MODEL'),
@@ -210,15 +278,21 @@ export function Settings() {
         window.api.getConfigValue('CONTEXT_COMPRESSION_HARD'),
         window.api.getConfigValue('CONTEXT_COMPRESSION_CRITICAL'),
         window.api.getConfigValue('EVAL_TEMPLATE_DEFAULT_ID'),
+        window.api.getConfigValue('EVAL_BACKEND'),
+        window.api.getConfigValue('VLMEVAL_MODEL_ID'),
+        window.api.getConfigValue('VLMEVAL_USE_CUSTOM_MODEL'),
       ])
 
       const nextAnthropicKey = anthropicKeyResult.value ?? ''
+      const nextJudgeKey = judgeKeyResult.value ?? ''
       const nextGoogleKey = googleKeyResult.value ?? ''
       const nextSeedreamKey = seedreamKeyResult.value ?? ''
       const nextSeedreamEndpointId = seedreamEndpointResult.value ?? ''
       const nextSeedreamBaseUrl = seedreamBaseUrlResult.value ?? ''
       const nextAnthropicBaseUrl = anthropicBaseUrlResult.value ?? ''
       const nextAnthropicModel = anthropicModelResult.value ?? ''
+      const nextJudgeBaseUrl = judgeBaseUrlResult.value ?? ''
+      const nextJudgeModel = judgeModelResult.value ?? ''
       const nextCodexKey = codexKeyResult.value ?? ''
       const nextCodexBaseUrl = codexBaseUrlResult.value ?? ''
       const nextCodexModel = codexModelResult.value ?? DEFAULT_CODEX_MODEL
@@ -252,14 +326,23 @@ export function Settings() {
         DEFAULT_CONTEXT_COMPRESSION_CRITICAL,
       )
       const nextEvalTemplateDefaultId = evalTemplateDefaultIdResult.value ?? ''
+      const nextEvalBackend = normalizeEvaluationBackend(evalBackendResult.value)
+      const nextVlmevalModelId = vlmevalModelIdResult.value ?? ''
+      const nextVlmevalUseCustomModel = normalizeBooleanConfig(
+        vlmevalUseCustomModelResult.value,
+        DEFAULT_VLMEVAL_USE_CUSTOM_MODEL,
+      )
 
       setAnthropicInput(nextAnthropicKey)
+      setJudgeInput(nextJudgeKey)
       setGoogleInput(nextGoogleKey)
       setSeedreamInput(nextSeedreamKey)
       setSeedreamEndpointId(nextSeedreamEndpointId)
       setSeedreamBaseUrl(nextSeedreamBaseUrl)
       setAnthropicBaseUrl(nextAnthropicBaseUrl)
       setAnthropicModel(nextAnthropicModel)
+      setJudgeBaseUrl(nextJudgeBaseUrl)
+      setJudgeModel(nextJudgeModel)
       setCodexInput(nextCodexKey)
       setCodexBaseUrl(nextCodexBaseUrl)
       setCodexModel(nextCodexModel)
@@ -277,6 +360,9 @@ export function Settings() {
       setContextCompressionHardInput(nextContextCompressionHard)
       setContextCompressionCriticalInput(nextContextCompressionCritical)
       setEvalTemplateDefaultIdInput(nextEvalTemplateDefaultId)
+      setEvalBackend(nextEvalBackend)
+      setVlmevalModelId(nextVlmevalModelId)
+      setVlmevalUseCustomModel(nextVlmevalUseCustomModel)
       setAnthropicCustomEnabled(Boolean(nextAnthropicBaseUrl || nextAnthropicModel))
       setCodexCustomEnabled(Boolean((codexBaseUrlResult.value ?? '') || (codexModelResult.value ?? '')))
       setGoogleCustomEnabled(Boolean(nextGoogleBaseUrl || nextGoogleImageModel))
@@ -302,6 +388,16 @@ export function Settings() {
       })
   }, [])
 
+  useEffect(() => {
+    setAnthropicModelOptions([])
+    setAnthropicModelListMessage(null)
+  }, [anthropicBaseUrl, anthropicInput])
+
+  useEffect(() => {
+    setJudgeModelOptions([])
+    setJudgeModelListMessage(null)
+  }, [judgeBaseUrl, judgeInput])
+
   const handleSave = useCallback(
     async (key: string, value: string, label: string) => {
       const trimmedValue = value.trim()
@@ -313,6 +409,7 @@ export function Settings() {
       if (ok) {
         setMessage({ type: 'success', text: `${label} 已保存` })
         if (key === 'ANTHROPIC_API_KEY') setAnthropicInput(trimmedValue)
+        if (key === 'JUDGE_API_KEY') setJudgeInput(trimmedValue)
         if (key === 'CODEX_API_KEY') setCodexInput(trimmedValue)
         if (key === 'GOOGLE_API_KEY') setGoogleInput(trimmedValue)
         if (key === 'APIKEY_SEEDREAM') setSeedreamInput(trimmedValue)
@@ -457,6 +554,42 @@ export function Settings() {
     [saveKey],
   )
 
+  const handleSaveEvalBackend = useCallback(async () => {
+    await handleSave('EVAL_BACKEND', evalBackend, '视觉评估后端')
+  }, [evalBackend, handleSave])
+
+  const handleSaveVLMEvalConfig = useCallback(async () => {
+    const trimmedModelId = vlmevalModelId.trim()
+    setVlmevalModelId(trimmedModelId)
+    await handleSaveCustom(
+      [
+        { key: 'VLMEVAL_MODEL_ID', value: trimmedModelId },
+        { key: 'VLMEVAL_USE_CUSTOM_MODEL', value: String(vlmevalUseCustomModel) },
+      ],
+      'VLMEvalKit 配置',
+    )
+  }, [handleSaveCustom, vlmevalModelId, vlmevalUseCustomModel])
+
+  const handleSaveJudgeConfig = useCallback(async () => {
+    const trimmedApiKey = judgeInput.trim()
+    const trimmedBaseUrl = judgeBaseUrl.trim()
+    const trimmedModel = judgeModel.trim()
+    setJudgeInput(trimmedApiKey)
+    setJudgeBaseUrl(trimmedBaseUrl)
+    setJudgeModel(trimmedModel)
+    await handleSaveCustom(
+      [
+        { key: 'JUDGE_API_KEY', value: trimmedApiKey },
+        { key: 'JUDGE_BASE_URL', value: trimmedBaseUrl },
+        { key: 'JUDGE_MODEL', value: trimmedModel },
+      ],
+      'Judge 配置',
+    )
+  }, [handleSaveCustom, judgeBaseUrl, judgeInput, judgeModel])
+
+  const showAgentModelWarning =
+    agentEngine === 'claude_sdk' && isLikelyNonClaudeModel(anthropicModel)
+
   const handleProviderChange = useCallback(
     async (provider: ImageProviderName) => {
       setSaving(true)
@@ -512,6 +645,98 @@ export function Settings() {
       setTestingAnthropic(false)
     }
   }, [anthropicInput, anthropicBaseUrl, anthropicModel])
+
+  const handleFetchAnthropicModels = useCallback(async () => {
+    if (!anthropicInput.trim()) {
+      const nextMessage = { type: 'error' as const, text: '请先输入 Anthropic API Key 再获取模型列表' }
+      setAnthropicModelListMessage(nextMessage)
+      setMessage(nextMessage)
+      return
+    }
+
+    setFetchingAnthropicModels(true)
+    setAnthropicModelOptions([])
+    setAnthropicModelListMessage(null)
+    setMessage(null)
+    try {
+      const result = await window.api.fetchAnthropicModels({
+        apiKey: anthropicInput,
+        baseUrl: anthropicBaseUrl,
+      })
+      const nextMessage = {
+        type: result.success ? 'success' : 'error',
+        text: result.success
+          ? `${result.message}，请从下拉框选择或继续手动填写模型`
+          : `获取模型列表失败：${result.message}`,
+      } as const
+
+      if (result.success) {
+        setAnthropicModelOptions(result.models)
+        if (!anthropicModel.trim() && result.models[0]?.id) {
+          setAnthropicModel(result.models[0].id)
+        }
+      }
+
+      setAnthropicModelListMessage(nextMessage)
+      setMessage(nextMessage)
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      const nextMessage = { type: 'error' as const, text: `获取模型列表失败：${text}` }
+      setAnthropicModelListMessage(nextMessage)
+      setMessage(nextMessage)
+    } finally {
+      setFetchingAnthropicModels(false)
+    }
+  }, [anthropicBaseUrl, anthropicInput, anthropicModel])
+
+  const handleFetchJudgeModels = useCallback(async () => {
+    const effectiveApiKey = judgeInput.trim() || anthropicInput.trim()
+    const effectiveBaseUrl = judgeBaseUrl.trim() || anthropicBaseUrl.trim()
+
+    if (!effectiveApiKey) {
+      const nextMessage = {
+        type: 'error' as const,
+        text: '请先输入 Judge API Key；若未单独配置，也可先保留 Agent Anthropic Key 作为回退。',
+      }
+      setJudgeModelListMessage(nextMessage)
+      setMessage(nextMessage)
+      return
+    }
+
+    setFetchingJudgeModels(true)
+    setJudgeModelOptions([])
+    setJudgeModelListMessage(null)
+    setMessage(null)
+    try {
+      const result = await window.api.fetchJudgeModels({
+        apiKey: effectiveApiKey,
+        baseUrl: effectiveBaseUrl || undefined,
+      })
+      const nextMessage = {
+        type: result.success ? 'success' : 'error',
+        text: result.success
+          ? `${result.message}，请从下拉框选择或继续手动填写模型`
+          : `获取 Judge 模型列表失败：${result.message}`,
+      } as const
+
+      if (result.success) {
+        setJudgeModelOptions(result.models)
+        if (!judgeModel.trim() && result.models[0]?.id) {
+          setJudgeModel(result.models[0].id)
+        }
+      }
+
+      setJudgeModelListMessage(nextMessage)
+      setMessage(nextMessage)
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      const nextMessage = { type: 'error' as const, text: `获取 Judge 模型列表失败：${text}` }
+      setJudgeModelListMessage(nextMessage)
+      setMessage(nextMessage)
+    } finally {
+      setFetchingJudgeModels(false)
+    }
+  }, [anthropicBaseUrl, anthropicInput, judgeBaseUrl, judgeInput, judgeModel])
 
   const buildCodexTroubleshootingHint = useCallback((raw: string): string => {
     const commonHint =
@@ -934,10 +1159,10 @@ export function Settings() {
           <div className="flex items-center justify-between">
             <div>
               <h3 className="text-sm font-medium text-gray-200">
-                Anthropic API Key
+                Agent 编排（Claude SDK / Anthropic-compatible）
               </h3>
               <p className="text-xs text-gray-500 mt-0.5">
-                用于 Claude Agent SDK 和 VLMEvalKit judge 模型
+                仅用于 Claude SDK 编排、Anthropic draft fallback 和评估模板 AI 草稿，不用于 `evaluate_image` Judge。
               </p>
             </div>
             {isChecking ? (
@@ -1001,18 +1226,62 @@ export function Settings() {
 
             {anthropicCustomEnabled && (
               <>
-                <input
-                  value={anthropicBaseUrl}
-                  onChange={(e) => setAnthropicBaseUrl(e.target.value)}
-                  placeholder="自定义 Base URL（可留空回退官方）"
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
-                />
-                <input
-                  value={anthropicModel}
-                  onChange={(e) => setAnthropicModel(e.target.value)}
-                  placeholder="自定义模型（如 claude-sonnet-4-20250514）"
-                  className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
-                />
+                <div className="flex gap-2">
+                  <input
+                    value={anthropicBaseUrl}
+                    onChange={(e) => setAnthropicBaseUrl(e.target.value)}
+                    placeholder="自定义 Base URL（可留空回退官方）"
+                    className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                  />
+                  <button
+                    type="button"
+                    data-testid="settings-anthropic-fetch-models-button"
+                    onClick={handleFetchAnthropicModels}
+                    disabled={fetchingAnthropicModels || saving}
+                    className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors whitespace-nowrap"
+                  >
+                    {fetchingAnthropicModels ? '获取中...' : '获取模型列表'}
+                  </button>
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    value={anthropicModel}
+                    onChange={(e) => setAnthropicModel(e.target.value)}
+                    placeholder="自定义模型（如 claude-sonnet-4-20250514）"
+                    className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+                  />
+                  <select
+                    data-testid="settings-anthropic-model-select"
+                    value={
+                      anthropicModelOptions.some((option) => option.id === anthropicModel)
+                        ? anthropicModel
+                        : ''
+                    }
+                    onChange={(e) => setAnthropicModel(e.target.value)}
+                    disabled={anthropicModelOptions.length === 0 || fetchingAnthropicModels}
+                    className="w-72 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+                  >
+                    <option value="">
+                      {anthropicModelOptions.length > 0 ? '从已获取列表中选择模型' : '先获取模型列表'}
+                    </option>
+                    {anthropicModelOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.displayName} ({option.id})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {anthropicModelListMessage && (
+                  <div
+                    className={`rounded-lg px-3 py-2 text-xs ${
+                      anthropicModelListMessage.type === 'success'
+                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                        : 'bg-red-500/10 text-red-400 border border-red-500/30'
+                    }`}
+                  >
+                    {anthropicModelListMessage.text}
+                  </div>
+                )}
                 <div className="flex justify-end">
                   <button
                     onClick={() =>
@@ -1034,6 +1303,12 @@ export function Settings() {
             )}
           </div>
         </div>
+
+        {showAgentModelWarning && (
+          <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            当前 `AGENT_ENGINE=claude_sdk`，但 Agent 模型看起来不是 Claude 系列。像 GLM、Qwen、Gemini 这类多模态 Judge 模型更建议填写到下方“视觉评测 Judge”区域，避免影响 Claude SDK 编排。
+          </div>
+        )}
 
         {/* Codex */}
         <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 space-y-3">
@@ -1136,6 +1411,171 @@ export function Settings() {
             )}
           </div>
         </div>
+      </section>
+
+      <section className="space-y-4">
+        <h2 className="text-lg font-semibold text-gray-200">视觉评估</h2>
+        <p className="text-sm text-gray-400">
+          配置在线图片评测后端。默认使用当前自定义 judge；切换到 VLMEvalKit 后，可复用其多模态评测抽象能力。
+        </p>
+
+        <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 space-y-3">
+          <div>
+            <h3 className="text-sm font-medium text-gray-200">评测后端</h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              `custom_anthropic` 更贴近现有线上逻辑，`vlmevalkit` 适合做统一多模态评测适配层。
+            </p>
+          </div>
+          <div className="flex gap-2 items-center">
+            <select
+              data-testid="settings-eval-backend-select"
+              value={evalBackend}
+              onChange={(e) => setEvalBackend(e.target.value as EvaluationBackendName)}
+              className="w-56 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+            >
+              <option value="custom_anthropic">custom_anthropic</option>
+              <option value="vlmevalkit">vlmevalkit</option>
+            </select>
+            <button
+              onClick={handleSaveEvalBackend}
+              disabled={saving}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+            >
+              保存后端
+            </button>
+          </div>
+        </div>
+
+        <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 space-y-3">
+          <div>
+            <h3 className="text-sm font-medium text-gray-200">视觉评测 Judge（Anthropic-compatible）</h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              仅用于 `evaluate_image`。若留空，运行时会自动回退到 Agent 侧 `ANTHROPIC_*` 配置。
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <input
+              data-testid="settings-judge-api-key-input"
+              type="text"
+              value={judgeInput}
+              onChange={(e) => setJudgeInput(e.target.value)}
+              placeholder="Judge API Key（可留空走回退）"
+              className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+            />
+            <button
+              onClick={() => handleSave('JUDGE_API_KEY', judgeInput, 'Judge API Key')}
+              disabled={!judgeInput.trim() || saving}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+            >
+              保存
+            </button>
+          </div>
+          <div className="flex gap-2">
+            <input
+              data-testid="settings-judge-base-url-input"
+              value={judgeBaseUrl}
+              onChange={(e) => setJudgeBaseUrl(e.target.value)}
+              placeholder="Judge Base URL（如 https://cloud.infini-ai.com/maas/coding）"
+              className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+            />
+            <button
+              type="button"
+              data-testid="settings-judge-fetch-models-button"
+              onClick={handleFetchJudgeModels}
+              disabled={fetchingJudgeModels || saving}
+              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors whitespace-nowrap"
+            >
+              {fetchingJudgeModels ? '获取中...' : '获取模型列表'}
+            </button>
+          </div>
+          <div className="flex gap-2">
+            <input
+              data-testid="settings-judge-model-input"
+              value={judgeModel}
+              onChange={(e) => setJudgeModel(e.target.value)}
+              placeholder="Judge 模型（如 glm-4v-plus-0111）"
+              className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+            />
+            <select
+              data-testid="settings-judge-model-select"
+              value={judgeModelOptions.some((option) => option.id === judgeModel) ? judgeModel : ''}
+              onChange={(e) => setJudgeModel(e.target.value)}
+              disabled={judgeModelOptions.length === 0 || fetchingJudgeModels}
+              className="w-72 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+            >
+              <option value="">
+                {judgeModelOptions.length > 0 ? '从已获取列表中选择 Judge 模型' : '先获取模型列表'}
+              </option>
+              {judgeModelOptions.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.displayName} ({option.id})
+                </option>
+              ))}
+            </select>
+          </div>
+          {judgeModelListMessage && (
+            <div
+              className={`rounded-lg px-3 py-2 text-xs ${
+                judgeModelListMessage.type === 'success'
+                  ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                  : 'bg-red-500/10 text-red-400 border border-red-500/30'
+              }`}
+            >
+              {judgeModelListMessage.text}
+            </div>
+          )}
+          <div className="rounded-lg border border-gray-700/50 bg-gray-900/60 px-3 py-2 text-xs text-gray-400">
+            推荐把 `glm-4v-plus-0111`、`qwen-vl-max` 这类视觉 Judge 模型配置在这里，而不是填到 Agent Anthropic 模型里。
+          </div>
+          <div className="flex justify-end">
+            <button
+              onClick={handleSaveJudgeConfig}
+              disabled={saving}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+            >
+              保存 Judge 配置
+            </button>
+          </div>
+        </div>
+
+        {evalBackend === 'vlmevalkit' && (
+          <div className="bg-gray-800/50 border border-gray-700/50 rounded-xl p-4 space-y-3">
+            <div>
+              <h3 className="text-sm font-medium text-gray-200">VLMEvalKit 配置</h3>
+              <p className="text-xs text-gray-500 mt-0.5">
+                首版用于在线单图评测。关闭自定义 model adapter 后，需确保所填模型是 VLMEvalKit 已注册且支持视觉输入的模型。
+              </p>
+            </div>
+            <input
+              data-testid="settings-vlmeval-model-id-input"
+              value={vlmevalModelId}
+              onChange={(e) => setVlmevalModelId(e.target.value)}
+              placeholder="如 claude-sonnet-4-20250514 或 qwen2.5-vl-72b-instruct"
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-blue-500 focus:outline-none font-mono"
+            />
+            <label className="flex items-center gap-2 text-xs text-gray-400">
+              <input
+                data-testid="settings-vlmeval-use-custom-model-checkbox"
+                type="checkbox"
+                checked={vlmevalUseCustomModel}
+                onChange={(e) => setVlmevalUseCustomModel(e.target.checked)}
+              />
+              优先使用项目内置自定义 model adapter
+            </label>
+            <div className="rounded-lg border border-gray-700/50 bg-gray-900/60 px-3 py-2 text-xs text-gray-400">
+              使用内置 adapter 时，会优先复用当前 Judge 配置；若 Judge 未单独配置，再回退到 `ANTHROPIC_*`。关闭后将尝试按 `VLMEVAL_MODEL_ID` 直接走 VLMEvalKit 模型注册表。
+            </div>
+            <div className="flex justify-end">
+              <button
+                onClick={handleSaveVLMEvalConfig}
+                disabled={saving}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-lg text-sm transition-colors"
+              >
+                保存 VLMEvalKit 配置
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="space-y-4">

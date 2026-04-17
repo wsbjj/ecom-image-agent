@@ -8,6 +8,8 @@ export const IPC_CHANNELS = {
   CONFIG_GET_VALUE: 'config:get-value',
   CONFIG_SET: 'config:set',
   CONFIG_TEST_ANTHROPIC: 'config:test-anthropic',
+  CONFIG_FETCH_ANTHROPIC_MODELS: 'config:fetch-anthropic-models',
+  CONFIG_FETCH_JUDGE_MODELS: 'config:fetch-judge-models',
   CONFIG_TEST_CODEX: 'config:test-codex',
   CONFIG_TEST_IMAGE_PROVIDER: 'config:test-image-provider',
   APP_USER_DATA_PATH: 'app:user-data-path',

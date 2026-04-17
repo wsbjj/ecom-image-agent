@@ -9,9 +9,19 @@ import type {
   DefectAnalysis,
   EvalRubric,
   EvalDimensionResult,
+  EvaluationBackendName,
 } from '../../shared/types'
 
 export type { EvalRequest, EvalResult }
+
+export interface VLMEvalBridgeStartOptions {
+  judgeApiKey?: string
+  judgeBaseUrl?: string
+  judgeModel?: string
+  evalBackend?: EvaluationBackendName
+  vlmevalModelId?: string
+  vlmevalUseCustomModel?: boolean
+}
 
 interface RawStdoutLine {
   request_id: string
@@ -33,6 +43,28 @@ interface PendingResolver {
 }
 
 const EVAL_TIMEOUT_MS = 120_000
+
+function buildPythonEnv(extraEnv?: Record<string, string | undefined>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUTF8: '1',
+    PYTHONIOENCODING: 'utf-8',
+  }
+
+  if (!extraEnv) {
+    return env
+  }
+
+  for (const [key, value] of Object.entries(extraEnv)) {
+    if (value === undefined) {
+      delete env[key]
+      continue
+    }
+    env[key] = value
+  }
+
+  return env
+}
 
 function buildLegacyView(dimensions: EvalDimensionResult[]): DefectAnalysis['legacy'] {
   const find = (key: string): { score: number; issues: string[] } => {
@@ -59,40 +91,83 @@ export class VLMEvalBridge {
 
   async start(
     pythonPath: string,
-    anthropicApiKey: string,
-    options?: { anthropicBaseUrl?: string; anthropicModel?: string },
+    options?: VLMEvalBridgeStartOptions,
   ): Promise<void> {
     const appPath = app.getAppPath()
     const scriptPath = path.join(appPath, 'python', 'vlmeval_server.py')
-    const requirementsPath = path.join(appPath, 'python', 'requirements.txt')
+    const coreRequirementsPath = path.join(appPath, 'python', 'requirements.txt')
+    const vlmevalRequirementsPath = path.join(appPath, 'python', 'requirements-vlmeval.txt')
     const workDir = app.getPath('userData')
-
-    const checkDeps = spawnSync(pythonPath, ['-X', 'utf8', '-c', 'import anthropic, pydantic'], {
-      encoding: 'utf8',
+    const evalBackend = options?.evalBackend ?? 'custom_anthropic'
+    const vlmevalUseCustomModel = options?.vlmevalUseCustomModel ?? true
+    const pythonEnv = buildPythonEnv()
+    const runtimeEnv = buildPythonEnv({
+      ...(options?.judgeApiKey ? { JUDGE_API_KEY: options.judgeApiKey } : {}),
+      ...(options?.judgeBaseUrl ? { JUDGE_BASE_URL: options.judgeBaseUrl } : {}),
+      ...(options?.judgeModel ? { JUDGE_MODEL: options.judgeModel } : {}),
+      EVAL_BACKEND: evalBackend,
+      ...(options?.vlmevalModelId ? { VLMEVAL_MODEL_ID: options.vlmevalModelId } : {}),
+      VLMEVAL_USE_CUSTOM_MODEL: String(vlmevalUseCustomModel),
     })
-    if (checkDeps.status !== 0) {
+
+    const coreImports = ['import pydantic']
+    if (evalBackend === 'custom_anthropic' || vlmevalUseCustomModel) {
+      coreImports.push('import anthropic')
+    }
+    const checkCoreDeps = spawnSync(
+      pythonPath,
+      ['-X', 'utf8', '-c', coreImports.join('; ')],
+      {
+        encoding: 'utf8',
+        env: pythonEnv,
+      },
+    )
+    if (checkCoreDeps.status !== 0) {
       const installDeps = spawnSync(
         pythonPath,
-        ['-X', 'utf8', '-m', 'pip', 'install', '-r', requirementsPath],
-        { encoding: 'utf8' },
+        ['-X', 'utf8', '-m', 'pip', 'install', '-r', coreRequirementsPath],
+        {
+          encoding: 'utf8',
+          env: pythonEnv,
+        },
       )
       if (installDeps.status !== 0) {
         const detail = installDeps.stderr || installDeps.stdout || 'unknown pip error'
         throw new Error(`Failed to install Python dependencies: ${detail}`)
       }
     }
+    if (evalBackend === 'vlmevalkit') {
+      const checkVLMEvalDeps = spawnSync(
+        pythonPath,
+        ['-X', 'utf8', '-c', 'import vlmeval'],
+        {
+          encoding: 'utf8',
+          env: pythonEnv,
+        },
+      )
+      if (checkVLMEvalDeps.status !== 0) {
+        const installVLMEvalDeps = spawnSync(
+          pythonPath,
+          ['-X', 'utf8', '-m', 'pip', 'install', '-r', vlmevalRequirementsPath],
+          {
+            encoding: 'utf8',
+            env: pythonEnv,
+          },
+        )
+        if (installVLMEvalDeps.status !== 0) {
+          const detail =
+            installVLMEvalDeps.stderr || installVLMEvalDeps.stdout || 'unknown pip error'
+          throw new Error(
+            `Failed to install VLMEvalKit dependencies from official Git source: ${detail}`,
+          )
+        }
+      }
+    }
 
     this.resetStderrDecoderState()
     this.proc = spawn(pythonPath, ['-X', 'utf8', scriptPath, '--workdir', workDir], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        PYTHONUTF8: '1',
-        PYTHONIOENCODING: 'utf-8',
-        ANTHROPIC_API_KEY: anthropicApiKey,
-        ...(options?.anthropicBaseUrl ? { ANTHROPIC_BASE_URL: options.anthropicBaseUrl } : {}),
-        ...(options?.anthropicModel ? { ANTHROPIC_MODEL: options.anthropicModel } : {}),
-      },
+      env: runtimeEnv,
     })
 
     this.rl = readline.createInterface({ input: this.proc.stdout })

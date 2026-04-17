@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import type { DefectAnalysis, TaskRecord } from '../../shared/types'
-import { toFileUrl } from '../lib/fileUrl'
 
 interface ImageCardProps {
   task: TaskRecord
@@ -73,9 +72,7 @@ function scoreBarColor(status: TaskRecord['status']): string {
 export function ImageCard({ task }: ImageCardProps) {
   const defects = parseDefects(task.defect_analysis)
   const issuePreview = defects ? defectIssuePreview(defects) : []
-  const [imageSrc, setImageSrc] = useState<string | null>(
-    task.image_path ? toFileUrl(task.image_path) : null,
-  )
+  const [imageSrc, setImageSrc] = useState<string | null>(null)
 
   useEffect(() => {
     let mounted = true
@@ -87,16 +84,16 @@ export function ImageCard({ task }: ImageCardProps) {
       }
     }
 
-    const fallbackUrl = toFileUrl(task.image_path)
+    setImageSrc(null)
     void window.api
       .readImageAsDataUrl(task.image_path)
       .then((result) => {
         if (!mounted) return
-        setImageSrc(result.dataUrl ?? fallbackUrl)
+        setImageSrc(result.dataUrl ?? null)
       })
       .catch(() => {
         if (!mounted) return
-        setImageSrc(fallbackUrl)
+        setImageSrc(null)
       })
 
     return () => {
